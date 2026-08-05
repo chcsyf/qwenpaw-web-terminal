@@ -1,0 +1,37 @@
+{
+  "id": "qwenpaw-web-terminal",
+  "name": "Web 终端",
+  "version": "0.0.1",
+  "description": "浏览器终端窗口插件 v0.0.1：多标签（每标签独立 PTY，关闭标签即结束终端）+ xterm.js 渲染（ANSI/光标/Tab 补全/复制粘贴）+ 单条命令执行（exec）+ WebSocket 交互式 PTY + 多会话 + 自动重连 + 惰性连接（切到终端页不再自动创建 bash 进程）",
+  "author": "QwenPaw QA Agent",
+  "license": "Apache-2.0",
+  "type": "app",
+  "qwenpaw_version": {
+    "min": "2.0.0",
+    "max": "2.1.0"
+  },
+  "entry": {
+    "backend": "plugin.py",
+    "frontend": "ui/index.js"
+  },
+  "menu": {
+    "label": "终端",
+    "icon": "🖥️",
+    "description": "浏览器终端窗口",
+    "location": "primary.settings"
+  },
+  "permissions": [
+    "workspace.write"
+  ],
+  "meta": {
+    "category": "developer-tools",
+    "icon": "🖥️",
+    "pawapp": {
+      "icon": "🖥️",
+      "category": "developer-tools",
+      "entry_page": "/apps/qwenpaw-web-terminal",
+      "launch_scope": "page"
+    }
+  },
+  "repository": "https://gitee.com/archigram/qwenpaw-web-terminal"
+}
