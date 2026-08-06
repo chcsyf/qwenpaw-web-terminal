@@ -1,6 +1,8 @@
 # 🖥️ Web 终端 (qwenpaw-web-terminal) v0.0.1
 
-浏览器终端窗口插件，由第三方扫雷插件（minesweeper-game）的 app 插件骨架改造而来。采用 [Apache License 2.0](LICENSE) 许可协议发布。
+浏览器终端窗口插件：多标签（每标签独立 PTY，关闭标签即结束终端）+ xterm.js 渲染（ANSI/光标/Tab 补全/复制粘贴）+ 单条命令执行（exec）+ WebSocket 交互式 PTY + 多会话 + 自动重连 + 惰性连接（切到终端页不再自动创建 bash 进程）。采用 [Apache License 2.0](LICENSE) 许可协议发布。
+
+> 由第三方扫雷插件（minesweeper-game）的 app 插件骨架改造而来
 
 ## 功能（v0.0.1）
 
@@ -72,7 +74,7 @@ qwenpaw-web-terminal/
 
 ## 变更记录
 
-
+见 [CHANGELOG.md](CHANGELOG.md)。
 
 ## 安全警告
 
