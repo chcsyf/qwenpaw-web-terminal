@@ -13,7 +13,7 @@
   var PLUGIN_ID = "qwenpaw-web-terminal";
   var API_BASE = "/api/qwenpaw-web-terminal";
   var FILES_BASE = "/api/plugins/" + PLUGIN_ID + "/files/ui/vendor";
-  var VERSION = "0.0.1";
+  var VERSION = "0.1.0";
 
   // ============ 样式（GitHub Dark） ============
   var S = {
@@ -64,7 +64,33 @@
       border: '1px solid #30363d', borderRadius: '6px',
       padding: '6px 12px', fontSize: '12px', maxWidth: '340px',
       boxShadow: '0 4px 12px rgba(0,0,0,0.4)'
-    }
+    },
+    // 会话管理面板
+    modalOverlay: {
+      position: 'absolute', top: 0, left: 0, right: 0, bottom: 0,
+      background: 'rgba(1,4,9,0.65)', zIndex: 200,
+      display: 'flex', alignItems: 'flex-start', justifyContent: 'center',
+      padding: '24px', overflow: 'auto'
+    },
+    modal: {
+      background: '#0d1117', border: '1px solid #30363d', borderRadius: '8px',
+      maxWidth: '900px', width: '100%', boxShadow: '0 8px 24px rgba(0,0,0,0.5)',
+      fontSize: '12px'
+    },
+    modalHeader: {
+      display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+      padding: '10px 14px', borderBottom: '1px solid #30363d', flexWrap: 'wrap', gap: '6px'
+    },
+    mgrTable: { width: '100%', borderCollapse: 'collapse' },
+    mgrTh: { textAlign: 'left', padding: '6px 10px', borderBottom: '1px solid #30363d', color: '#8b949e', fontWeight: 600 },
+    mgrTd: { padding: '6px 10px', borderBottom: '1px solid #21262d', verticalAlign: 'top' },
+    mgrBtn: {
+      padding: '3px 8px', borderRadius: '4px', border: '1px solid #30363d',
+      background: '#21262d', color: '#c9d1d9', cursor: 'pointer', fontSize: '11px', marginRight: '4px'
+    },
+    mgrBtnDanger: { background: 'rgba(248,81,73,0.12)', borderColor: '#f85149', color: '#f85149' },
+    mgrBtnOk: { background: 'rgba(63,185,80,0.12)', borderColor: '#3fb950', color: '#3fb950' },
+    mgrEmpty: { padding: '14px', color: '#8b949e', textAlign: 'center' }
   };
 
   // ============ xterm.js 加载 ============
@@ -130,6 +156,22 @@
     return h;
   }
 
+  // 标签布局持久化（localStorage）：刷新页面后恢复上次打开的标签；
+  // 后端会话全量放「会话管理」面板查看，标签栏只保留用户主动打开过的会话
+  var LS_TABS = 'qwenpaw-web-terminal.tabs.v1';
+  function loadSavedTabs() {
+    try {
+      var raw = localStorage.getItem(LS_TABS);
+      if (!raw) return [];
+      var arr = JSON.parse(raw);
+      if (!Array.isArray(arr)) return [];
+      return arr.filter(function (x) { return typeof x === 'string' && x; });
+    } catch (e) { return []; }
+  }
+  function saveTabs(ids) {
+    try { localStorage.setItem(LS_TABS, JSON.stringify(ids)); } catch (e) { /* ignore */ }
+  }
+
   // ============ 终端组件（多标签） ============
   function TerminalComponent() {
     var tabsRef = React.useRef(new Map());   // id -> tab 实例 {id, term, fit, ws, buf, cwd, wsState, reconnectCount, reconnectTimer, pending}
@@ -148,6 +190,9 @@
     var [wsStates, setWsStates] = React.useState({});  // id -> closed|connecting|open
     var [cwdMap, setCwdMap] = React.useState({});      // id -> cwd
     var [toast, setToast] = React.useState(null);      // 右上角临时提示（不写入终端，避免打断内容）
+    var [showMgr, setShowMgr] = React.useState(false); // 会话管理面板
+    var [mgrData, setMgrData] = React.useState(null);  // {sessions:[...]} 或 {error}
+    var [mgrLoading, setMgrLoading] = React.useState(false);
 
     // ---- tab 实例管理 ----
     function getTab(id) {
@@ -437,6 +482,7 @@
         var order = tabOrderRef.current.concat([id]);
         tabOrderRef.current = order;
         setTabOrder(order);
+        saveTabs(order);
       }
       activateTab(id);
       // 渲染后由 useEffect 完成 init + connect
@@ -498,6 +544,7 @@
       var order = tabOrderRef.current.filter(function (x) { return x !== id; });
       tabOrderRef.current = order;
       setTabOrder(order);
+      saveTabs(order);
       setWsStates(function (prev) { var n = Object.assign({}, prev); delete n[id]; return n; });
       setCwdMap(function (prev) { var n = Object.assign({}, prev); delete n[id]; return n; });
       if (activeIdRef.current === id) {
@@ -539,6 +586,89 @@
       }
     }
 
+    // ---- 会话管理面板 ----
+    function fmtBytes(n) {
+      if (n < 1024) return n + ' B';
+      if (n < 1048576) return (n / 1024).toFixed(1) + ' KB';
+      return (n / 1048576).toFixed(1) + ' MB';
+    }
+    function fmtTime(t) {
+      if (!t) return '—';
+      return new Date(t * 1000).toLocaleTimeString();
+    }
+    function ptyBadge(s) {
+      if (!s || !s.pty) return h('span', { style: { color: '#8b949e' } }, '—');
+      var p = s.pty;
+      if (!p.running) return h('span', { style: { color: '#8b949e' } }, '空闲');
+      if (p.connected) return h('span', { style: { color: '#3fb950' } }, '● 运行中·已连接');
+      return h('span', { style: { color: '#d29922' } },
+        '◉ 后台运行' + (p.buffered ? '（缓冲 ' + fmtBytes(p.buffered) + '）' : ''));
+    }
+    function refreshMgr() {
+      setMgrLoading(true);
+      fetch(API_BASE + '/sessions')
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          setMgrData((d && d.ok) ? d : { sessions: [], error: (d && d.error) || '加载失败' });
+          setMgrLoading(false);
+        })
+        .catch(function () { setMgrData({ sessions: [], error: '请求失败' }); setMgrLoading(false); });
+    }
+    function openMgr() { refreshMgr(); setShowMgr(true); }
+    function closeMgr() { setShowMgr(false); }
+    function mgrOpenSession(id) {
+      var tab = getTab(id);
+      if (tabOrderRef.current.indexOf(id) < 0) createTab(id);
+      else switchTab(id);
+      ensureConnected(getTab(id));
+      setShowMgr(false);
+      showToast('已打开会话：' + id + '（后台进程将自动 attach）');
+    }
+    function mgrKillSession(id) {
+      fetch(API_BASE + '/sessions/' + encodeURIComponent(id) + '/kill', { method: 'POST' })
+        .then(function (r) { return r.json(); })
+        .then(function (d) { refreshMgr(); showToast('已结束进程：' + id + (d && d.killed ? '' : '（无运行进程）')); });
+    }
+    function mgrDeleteSession(id) {
+      fetch(API_BASE + '/sessions/' + encodeURIComponent(id), { method: 'DELETE' })
+        .then(function (r) { return r.json(); })
+        .then(function () {
+          // 若该会话是打开的标签，一并关掉
+          if (tabsRef.current.has(id)) closeTab(id);
+          refreshMgr();
+          showToast('已删除会话：' + id);
+        });
+    }
+    function mgrKillAllIdle() {
+      var list = (mgrData && mgrData.sessions) || [];
+      var idle = list.filter(function (s) { return s.pty && s.pty.detached; });
+      if (!idle.length) { showToast('没有后台空闲会话'); return; }
+      var ids = idle.map(function (s) { return s.id; });
+      var p = Promise.resolve();
+      ids.forEach(function (id) {
+        p = p.then(function () {
+          return fetch(API_BASE + '/sessions/' + encodeURIComponent(id) + '/kill', { method: 'POST' });
+        });
+      });
+      p.then(function () { refreshMgr(); showToast('已结束 ' + ids.length + ' 个后台会话'); });
+    }
+    function mgrCreateSession() {
+      var name = window.prompt('新会话 ID（字母/数字/中划线）：', 's' + Math.floor(Date.now() / 1000).toString(36));
+      if (!name) return;
+      name = String(name).trim().replace(/[^a-zA-Z0-9_-]/g, '-');
+      if (!name) return;
+      fetch(API_BASE + '/sessions', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
+        body: JSON.stringify({ id: name })
+      })
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          if (d && d.ok) { refreshMgr(); showToast('已创建会话：' + name); }
+          else { window.alert((d && d.error) || '创建失败'); }
+        });
+    }
+
     // ---- 初始化：加载 vendor ----
     React.useEffect(function () {
       loadVendor(function () {
@@ -561,58 +691,40 @@
         .then(function (r) { return r.json(); })
         .then(function (d) {
           var list = (d && d.ok && d.sessions) ? d.sessions : [];
-          if (list.length) {
-            var newIds = [];
-            var cwdInit = {};
-            list.forEach(function (s) {
-              var tab = getTab(s.id);
-              tab.cwd = s.cwd || '';
-              cwdInit[s.id] = s.cwd || '';
-              // 增量合并：已存在的标签不重复添加、不覆盖用户刚创建/激活的标签
-              if (tabOrderRef.current.indexOf(s.id) < 0) newIds.push(s.id);
-            });
-            if (newIds.length) {
-              var order = tabOrderRef.current.concat(newIds);
-              tabOrderRef.current = order;
-              setTabOrder(order);
-              setCwdMap(function (prev) { return Object.assign({}, prev, cwdInit); });
+          var sessMap = {};
+          list.forEach(function (s) { sessMap[s.id] = s; });
+          var agentId = agentHeaders()['X-Agent-Id'] || 'default';
+          // 标签 = 上次打开的（localStorage）；首次进入 = 当前智能体会话（或 default）
+          var saved = loadSavedTabs();
+          var ids;
+          if (saved.length) {
+            ids = saved;
+          } else {
+            ids = [];
+            if (sessMap[agentId]) ids.push(agentId);
+            if (ids.indexOf('default') < 0) ids.push('default');
+          }
+          var cwdInit = {};
+          var order = [];
+          ids.forEach(function (id) {
+            if (!id) return;
+            var tab = getTab(id);
+            if (sessMap[id]) {
+              tab.cwd = sessMap[id].cwd || '';
+              cwdInit[id] = sessMap[id].cwd || '';
             }
-            // 首次进入：优先激活当前智能体标签，否则第一个
-            if (activeIdRef.current === null && tabOrderRef.current.length) {
-              var agentId = agentHeaders()['X-Agent-Id'] || 'default';
-              var target = tabOrderRef.current.indexOf(agentId) >= 0 ? agentId : tabOrderRef.current[0];
+            if (order.indexOf(id) < 0) order.push(id);
+          });
+          if (order.length) {
+            tabOrderRef.current = order;
+            setTabOrder(order);
+            setCwdMap(function (prev) { return Object.assign({}, prev, cwdInit); });
+            if (activeIdRef.current === null) {
+              var target = order.indexOf(agentId) >= 0 ? agentId : order[0];
               activateTab(target);
             }
-          } else if (!tabOrderRef.current.length) {
+          } else {
             createTab('default');
-          }
-          // 确保当前智能体（非 default）有对应标签；后端按 X-Agent-Id 解析 cwd 到智能体工作区
-          var agentHdr = agentHeaders();
-          var agentId2 = agentHdr['X-Agent-Id'] || 'default';
-          if (agentId2 !== 'default' && tabOrderRef.current.indexOf(agentId2) < 0) {
-            fetch(API_BASE + '/sessions', {
-              method: 'POST',
-              headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
-              body: JSON.stringify({ id: agentId2 })
-            })
-              .then(function (r) { return r.json(); })
-              .then(function (dr) {
-                if (dr && dr.ok) {
-                  var tab = getTab(agentId2);
-                  tab.cwd = dr.cwd || '';
-                  if (tabOrderRef.current.indexOf(agentId2) < 0) {
-                    var order2 = tabOrderRef.current.concat([agentId2]);
-                    tabOrderRef.current = order2;
-                    setTabOrder(order2);
-                    setCwdMap(function (prev) { var n = Object.assign({}, prev); n[agentId2] = dr.cwd || ''; return n; });
-                  }
-                  // 首次进入且用户尚未主动选择其它标签时，切到当前智能体标签
-                  if (activeIdRef.current === null || activeIdRef.current === 'default') {
-                    activateTab(agentId2);
-                  }
-                }
-              })
-              .catch(function () {});
           }
         })
         .catch(function () {
@@ -675,6 +787,7 @@
         h('span', { style: Object.assign({}, S.badge, S.badgeGreen) }, '📁 ' + (activeCwd || '~')),
         renderWsStatus(activeWsState),
         h('button', { style: Object.assign({}, S.button, S.buttonAccent), onClick: newTab }, '＋ 新标签'),
+        h('button', { style: Object.assign({}, S.button, S.buttonAccent), onClick: openMgr }, '🗂 会话管理'),
         h('button', { style: Object.assign({}, S.tab, mode === 'pty' ? S.tabActive : {}), onClick: function () { switchMode('pty'); } }, '🖥️ 交互式终端'),
         h('button', { style: Object.assign({}, S.tab, mode === 'exec' ? S.tabActive : {}), onClick: function () { switchMode('exec'); } }, '⚡ 单条命令'),
         h('button', { style: S.button, onClick: copySelection }, '复制'),
@@ -710,8 +823,56 @@
         });
       })),
       h('div', { style: S.hint },
-        '多标签：每标签独立终端，切换不中断，点 × 关闭并结束该终端 | 模式：' + (mode === 'pty' ? '交互式 PTY' : '单条命令 exec') +
+        '多标签：每标签独立终端，切换不中断，点 × 关闭并结束该终端 | 刷新/断网时终端转入后台保留（输出缓冲），可在「🗂 会话管理」查看、结束或清理 | 模式：' + (mode === 'pty' ? '交互式 PTY' : '单条命令 exec') +
         ' | 复制：选中后点「复制」 | 粘贴：点「粘贴」或 Ctrl+Shift+V | 断开自动重连（最多 5 次）'),
+      // 会话管理面板
+      showMgr ? h('div', {
+        style: S.modalOverlay,
+        onClick: function (e) { if (e.target === e.currentTarget) closeMgr(); }
+      }, [
+        h('div', { style: S.modal }, [
+          h('div', { style: S.modalHeader }, [
+            h('span', { style: { fontSize: '15px', fontWeight: 'bold', color: '#58a6ff' } }, '🗂 会话管理'),
+            h('div', {}, [
+              h('button', { style: S.mgrBtn, onClick: refreshMgr }, '⟳ 刷新'),
+              h('button', { style: Object.assign({}, S.mgrBtn, S.mgrBtnOk), onClick: mgrCreateSession }, '＋ 新建会话'),
+              h('button', { style: Object.assign({}, S.mgrBtn, S.mgrBtnDanger), onClick: mgrKillAllIdle }, '结束所有后台会话'),
+              h('button', { style: S.mgrBtn, onClick: closeMgr }, '✕ 关闭')
+            ])
+          ]),
+          (mgrLoading && !mgrData) ? h('div', { style: S.mgrEmpty }, '加载中...') : null,
+          mgrData ? h('table', { style: S.mgrTable }, [
+            h('thead', {}, h('tr', {}, [
+              h('th', { style: S.mgrTh }, '会话'),
+              h('th', { style: S.mgrTh }, '状态'),
+              h('th', { style: S.mgrTh }, 'PID'),
+              h('th', { style: S.mgrTh }, '最后活动'),
+              h('th', { style: S.mgrTh }, '操作')
+            ])),
+            h('tbody', {}, (mgrData.sessions || []).map(function (s) {
+              return h('tr', { key: s.id }, [
+                h('td', { style: S.mgrTd }, [
+                  h('div', { style: { fontWeight: 600, color: '#e6edf3' } }, s.id),
+                  h('div', { style: { color: '#8b949e', maxWidth: '320px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, s.cwd || '~')
+                ]),
+                h('td', { style: S.mgrTd }, ptyBadge(s)),
+                h('td', { style: S.mgrTd }, (s.pty && s.pty.pid) ? s.pty.pid : '—'),
+                h('td', { style: S.mgrTd }, fmtTime(s.last_activity)),
+                h('td', { style: S.mgrTd }, [
+                  h('button', { style: Object.assign({}, S.mgrBtn, S.mgrBtnOk), onClick: function () { mgrOpenSession(s.id); } }, '打开'),
+                  h('button', {
+                    style: S.mgrBtn,
+                    onClick: function () { mgrKillSession(s.id); },
+                    disabled: !(s.pty && s.pty.running)
+                  }, '结束'),
+                  h('button', { style: Object.assign({}, S.mgrBtn, S.mgrBtnDanger), onClick: function () { mgrDeleteSession(s.id); } }, '删除')
+                ])
+              ]);
+            })),
+            (!mgrData.sessions || !mgrData.sessions.length) ? h('tr', {}, h('td', { colSpan: 5, style: S.mgrEmpty }, '暂无会话 — 点「＋ 新建会话」创建')) : null
+          ]) : null
+        ])
+      ]) : null,
       toast ? h('div', { style: S.toast }, toast.text) : null
     ]);
   }

@@ -1,12 +1,19 @@
 """
-Web 终端插件 v0.0.1 - QwenPaw
+Web 终端插件 v0.1.0 - QwenPaw
 浏览器终端窗口：
   - GET    /api/qwenpaw-web-terminal/status            插件状态、版本、cwd（支持 ?session_id=）
-  - GET    /api/qwenpaw-web-terminal/sessions          会话列表（多会话）
-  - POST   /api/qwenpaw-web-terminal/sessions          创建会话 {id}
+  - GET    /api/qwenpaw-web-terminal/sessions          会话列表（含 PTY 运行状态，供管理面板）
+  - POST   /api/qwenpaw-web-terminal/sessions          创建会话 {id, cwd?}
+  - POST   /api/qwenpaw-web-terminal/sessions/{sid}/kill  结束该会话的 PTY 进程（保留会话状态）
   - DELETE /api/qwenpaw-web-terminal/sessions/{sid}    删除会话（并强制结束该会话活跃 PTY）
   - POST   /api/qwenpaw-web-terminal/exec              单条命令执行（sh -c，cd 会话持久）
   - WS     /api/qwenpaw-web-terminal/ws?session=x      交互式 PTY（bash，OSC 7 上报 cwd）
+
+v0.1.0 新增（会话持久化）：
+  - WS 意外断开（刷新/断网）不再 kill PTY 进程，进程转入后台保留，输出写入环形缓冲；
+    重新连接同会话自动 attach 并回放缓冲。正常关闭标签由前端显式 DELETE/kill 结束。
+  - GET /sessions 返回每个会话的 PTY 状态（运行/已连接/后台运行/缓冲大小），
+    配合前端「会话管理」面板进行打开、结束、删除、清理空闲。
 
 安全提醒：exec 与 PTY 均以 QwenPaw 进程身份执行宿主机 shell 命令，
 属于高危能力，仅建议在可信环境（本地/内网）使用。
@@ -21,6 +28,7 @@ import signal
 import struct
 import subprocess
 import termios
+import time
 from pathlib import Path
 
 from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
@@ -28,7 +36,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.0.1"
+PLUGIN_VERSION = "0.1.0"
 
 router = APIRouter()
 
@@ -45,17 +53,33 @@ for _candidate in (
         _DEFAULT_CWD = str(_ws)
         break
 
-_sessions: dict = {}  # session_id -> {"cwd": str}
-_active_pty: dict = {}  # session_id -> [{"ws": WebSocket, "proc": Popen}] 活跃 PTY 跟踪
+_sessions: dict = {}  # session_id -> {"cwd": str, "created_at": float}
+# 会话持久化 PTY 存储：session_id -> PTY 记录
+# 记录字段：
+#   proc: Popen          交互式 bash 进程
+#   master_fd: int       PTY master fd
+#   ws / connected      当前活跃 WS（无连接时为 None/False = 后台运行中）
+#   loop_task: Task     统一读取循环（connected 时输出到 WS，否则写环形缓冲）
+#   buf: bytes          后台期间输出环形缓冲（上限 _BUF_MAX，attach 时回放）
+#   created_at / last_activity: float
+_pty_store: dict = {}
+_BUF_MAX = 64 * 1024  # 后台输出缓冲上限 64KB（保留尾部）
 _exec_timeout = 60.0
 
 
 def _session_cwd(session_id: str = "default") -> str:
-    return _sessions.setdefault(session_id, {"cwd": _DEFAULT_CWD})["cwd"]
+    info = _sessions.setdefault(
+        session_id, {"cwd": _DEFAULT_CWD, "created_at": time.time()}
+    )
+    return info["cwd"]
 
 
 def _set_session_cwd(session_id: str, cwd: str) -> None:
-    _sessions.setdefault(session_id, {})["cwd"] = cwd
+    info = _sessions.setdefault(
+        session_id, {"cwd": _DEFAULT_CWD, "created_at": time.time()}
+    )
+    info["cwd"] = cwd
+    info["last_activity"] = time.time()
 
 
 def _agent_workspace(agent_id: str) -> str:
@@ -96,20 +120,40 @@ async def get_status(session_id: str = "default"):
         "version": PLUGIN_VERSION,
         "type": "pty",
         "cwd": _session_cwd(session_id),
-        "supports": ["exec", "pty_websocket", "sessions"],
+        "supports": ["exec", "pty_websocket", "sessions", "persistent_pty"],
     }
 
 
 @router.get("/sessions")
 async def list_sessions():
-    """列出所有会话及其 cwd"""
-    return {
-        "ok": True,
-        "sessions": [
-            {"id": sid, "cwd": info["cwd"]}
-            for sid, info in sorted(_sessions.items())
-        ],
-    }
+    """列出所有会话：id、cwd、PTY 运行状态（供管理面板展示与清理）。"""
+    now = time.time()
+    out = []
+    for sid, info in sorted(_sessions.items()):
+        entry = _pty_store.get(sid)
+        running = bool(entry and entry.get("proc") is not None and entry["proc"].poll() is None)
+        if running:
+            created_at = entry.get("created_at", now)
+            last_activity = entry.get("last_activity", now)
+        else:
+            created_at = info.get("created_at", now)
+            last_activity = info.get("last_activity", now)
+        out.append(
+            {
+                "id": sid,
+                "cwd": info["cwd"],
+                "created_at": created_at,
+                "last_activity": last_activity,
+                "pty": {
+                    "running": running,
+                    "pid": entry["proc"].pid if (running and entry) else 0,
+                    "connected": bool(running and entry and entry.get("connected")),
+                    "detached": bool(running and entry and not entry.get("connected")),
+                    "buffered": len(entry.get("buf", b"")) if running else 0,
+                },
+            }
+        )
+    return {"ok": True, "sessions": out}
 
 
 @router.post("/sessions")
@@ -129,21 +173,20 @@ async def create_session(req: SessionRequest, request: Request):
     return {"ok": True, "id": sid, "cwd": _session_cwd(sid)}
 
 
+@router.post("/sessions/{sid}/kill")
+async def kill_session_pty(sid: str):
+    """结束该会话的 PTY 进程（后台保留的终端）；会话状态保留，重连时重新拉起。
+    进程已死/不存在时幂等返回。"""
+    killed = _kill_pty(sid)
+    return {"ok": True, "id": sid, "killed": killed, "existed": sid in _sessions}
+
+
 @router.delete("/sessions/{sid}")
 async def delete_session(sid: str):
-    """删除会话状态；若该会话有活跃 PTY（WS 未正常关闭的兜底场景），
-    直接 killpg 强制结束对应 bash 进程组。"""
+    """删除会话状态；若该会话有活跃/后台 PTY，直接 killpg 强制结束进程组。"""
     existed = sid in _sessions
     _sessions.pop(sid, None)
-    killed = 0
-    for entry in list(_active_pty.get(sid, [])):
-        proc = entry.get("proc")
-        if proc is not None:
-            try:
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-                killed += 1
-            except Exception:  # noqa: BLE001
-                pass
+    killed = _kill_pty(sid)
     return {"ok": True, "id": sid, "existed": existed, "killed_pty": killed}
 
 
@@ -203,6 +246,8 @@ async def exec_cmd(req: ExecRequest, request: Request):
         logger.exception("[qwenpaw-web-terminal] exec failed")
         return {"ok": False, "error": f"执行失败: {exc}", "cwd": cwd}
 
+    # 更新会话活动时间
+    _sessions[session_id]["last_activity"] = time.time()
     return {
         "ok": True,
         "stdout": proc.stdout,
@@ -212,9 +257,14 @@ async def exec_cmd(req: ExecRequest, request: Request):
     }
 
 
-# ============ 交互式 PTY（WebSocket） ============
-def _spawn_pty(cwd: str):
-    """创建交互式 bash PTY 子进程，返回 (master_fd, proc)。
+# ============ 交互式 PTY（WebSocket + 会话持久化） ============
+def _append_buf(entry, data: bytes) -> None:
+    """写入后台环形缓冲（保留尾部 _BUF_MAX 字节）。"""
+    entry["buf"] = (entry.get("buf", b"") + data)[-_BUF_MAX:]
+
+
+def _spawn_pty(session_id: str, cwd: str):
+    """创建交互式 bash PTY 子进程并登记到 _pty_store，返回记录。
 
     通过 PROMPT_COMMAND 在每次提示符前输出 OSC 7（file://host/path）
     上报当前工作目录，前端解析后更新 cwd 显示。
@@ -235,11 +285,96 @@ def _spawn_pty(cwd: str):
         close_fds=True,
     )
     os.close(slave_fd)
-    return master_fd, proc
+    # 默认窗口 80x24
+    try:
+        fcntl.ioctl(
+            master_fd,
+            termios.TIOCSWINSZ,
+            struct.pack("HHHH", 24, 80, 0, 0),
+        )
+    except OSError:
+        pass
+    entry = {
+        "proc": proc,
+        "master_fd": master_fd,
+        "ws": None,
+        "connected": False,
+        "loop_task": None,
+        "buf": b"",
+        "created_at": time.time(),
+        "last_activity": time.time(),
+    }
+    _pty_store[session_id] = entry
+    logger.info(
+        "[qwenpaw-web-terminal] PTY session %s spawned (pid=%s, cwd=%s)",
+        session_id,
+        proc.pid,
+        cwd,
+    )
+    return entry
 
 
-async def _pty_reader(ws: WebSocket, master_fd: int):
-    """后台任务：master 输出 → WebSocket 文本帧。"""
+def _attach_or_spawn(session_id: str):
+    """返回该会话的 PTY 记录：进程存活则复用（attach），否则重新 spawn。"""
+    entry = _pty_store.get(session_id)
+    if entry and entry.get("proc") is not None and entry["proc"].poll() is None:
+        return entry
+    if entry:
+        _cleanup_pty(session_id, entry)
+    cwd = _sessions.get(session_id, {}).get("cwd", _DEFAULT_CWD)
+    return _spawn_pty(session_id, cwd)
+
+
+def _kill_pty(session_id: str) -> bool:
+    """结束该会话的 PTY 进程组并清理记录；无记录/已死返回 False。"""
+    entry = _pty_store.get(session_id)
+    if not entry:
+        return False
+    proc = entry.get("proc")
+    if proc is not None and proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+        except Exception:  # noqa: BLE001
+            pass
+    _cleanup_pty(session_id, entry)
+    return True
+
+
+def _cleanup_pty(session_id: str, entry) -> None:
+    """清理 PTY 记录（进程已退出 / 被 kill / 删除会话时调用）。"""
+    if _pty_store.get(session_id) is entry:
+        _pty_store.pop(session_id, None)
+    task = entry.get("loop_task")
+    if task is not None and not task.done():
+        # 不在读取循环自身内部时取消它（EOF 清理时 task 就是当前 task）
+        try:
+            if asyncio.current_task() is not task:
+                task.cancel()
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        os.close(entry["master_fd"])
+    except OSError:
+        pass
+    proc = entry.get("proc")
+    if proc is not None:
+        try:
+            proc.wait(timeout=1)
+        except Exception:  # noqa: BLE001
+            try:
+                proc.kill()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+async def _pty_loop(session_id: str, entry) -> None:
+    """统一读取循环：PTY 输出 → 活跃 WS（实时）或 环形缓冲（后台保留）。
+
+    - connected 时：输出经 WebSocket 发给前端
+    - 断开期间：写入 entry["buf"]（上限 _BUF_MAX），attach 时由 WS handler 回放
+    - 读到 EOF（bash 退出）→ 清理 PTY 记录（会话状态保留，可重新拉起）
+    """
+    master_fd = entry["master_fd"]
     while True:
         try:
             r, _, _ = select.select([master_fd], [], [], 0.1)
@@ -251,41 +386,72 @@ async def _pty_reader(ws: WebSocket, master_fd: int):
             except OSError:
                 break
             if not data:
-                break
-            await ws.send_text(data.decode("utf-8", errors="replace"))
+                break  # EOF：bash 进程已退出
+            entry["last_activity"] = time.time()
+            if entry.get("connected") and entry.get("ws") is not None:
+                try:
+                    await entry["ws"].send_text(data.decode("utf-8", errors="replace"))
+                except Exception:  # noqa: BLE001
+                    # WS 已失效（旧连接关闭竞态）：降级为缓冲
+                    entry["connected"] = False
+                    _append_buf(entry, data)
+            else:
+                _append_buf(entry, data)
         await asyncio.sleep(0.02)
+    # EOF / fd 错误：进程结束，清理记录（不删除会话状态）
+    logger.info(
+        "[qwenpaw-web-terminal] PTY session %s exited (pid=%s)",
+        session_id,
+        entry.get("proc") is not None and entry["proc"].pid or "?",
+    )
+    _cleanup_pty(session_id, entry)
 
 
 @router.websocket("/ws")
 async def pty_ws(ws: WebSocket):
-    """交互式终端：浏览器 <-> WebSocket <-> PTY(bash)。
+    """交互式终端：浏览器 <-> WebSocket <-> PTY(bash)，支持会话持久化。
 
     协议（文本帧）：
       - 普通文本   -> 写入 PTY（即用户输入）
       - \\x00resize:cols:rows -> 调整 PTY 窗口大小
       - \\x00ping   -> 回复 \\x00pong（心跳）
+
+    生命周期：
+      - 首次连接：spawn 新 bash；再次连接：若进程存活则 attach 原进程，
+        并回放断开期间缓冲的输出
+      - WS 断开（刷新/断网）：进程保留后台运行，输出写入缓冲；
+        由管理面板 / kill 接口结束，或关闭标签时前端显式 DELETE
     """
     session_id = ws.query_params.get("session", "default")
     await ws.accept()
     if session_id not in _sessions:
         # 新会话：默认落在当前智能体工作区（依据 X-Agent-Id 请求头）
         _set_session_cwd(session_id, _request_agent_cwd(ws))
-    cwd = _sessions[session_id]["cwd"]
-    master_fd, proc = _spawn_pty(cwd)
-    # 默认窗口 80x24
-    try:
-        fcntl.ioctl(
-            master_fd,
-            termios.TIOCSWINSZ,
-            struct.pack("HHHH", 24, 80, 0, 0),
-        )
-    except OSError:
-        pass
+    entry = _attach_or_spawn(session_id)
+    proc = entry["proc"]
 
-    reader_task = asyncio.create_task(_pty_reader(ws, master_fd))
-    _entry = {"ws": ws, "proc": proc}
-    _active_pty.setdefault(session_id, []).append(_entry)
-    logger.info("[qwenpaw-web-terminal] PTY session %s started (pid=%s)", session_id, proc.pid)
+    # 同一会话同一时刻只保留一个活跃 WS：踢掉旧连接（旧 handler 的 finally 不会误伤新连接）
+    if entry.get("connected") and entry.get("ws") is not None and entry["ws"] is not ws:
+        try:
+            await entry["ws"].close()
+        except Exception:  # noqa: BLE001
+            pass
+    entry["ws"] = ws
+    entry["connected"] = True
+    entry["last_activity"] = time.time()
+    # 回放后台期间缓冲的输出
+    if entry.get("buf"):
+        try:
+            await ws.send_text(entry["buf"].decode("utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001
+            pass
+        entry["buf"] = b""
+    # 确保读取循环运行
+    if entry.get("loop_task") is None or entry["loop_task"].done():
+        entry["loop_task"] = asyncio.create_task(_pty_loop(session_id, entry))
+    logger.info(
+        "[qwenpaw-web-terminal] PTY session %s attached (pid=%s)", session_id, proc.pid
+    )
     try:
         while True:
             msg = await ws.receive()
@@ -302,7 +468,7 @@ async def pty_ws(ws: WebSocket):
                 try:
                     _, cols, rows = text.split(":")
                     fcntl.ioctl(
-                        master_fd,
+                        entry["master_fd"],
                         termios.TIOCSWINSZ,
                         struct.pack("HHHH", int(rows), int(cols), 0, 0),
                     )
@@ -315,39 +481,24 @@ async def pty_ws(ws: WebSocket):
                 except Exception:  # noqa: BLE001
                     break
                 continue
+            entry["last_activity"] = time.time()
             try:
-                os.write(master_fd, text.encode("utf-8"))
+                os.write(entry["master_fd"], text.encode("utf-8"))
             except OSError:
                 break
     except WebSocketDisconnect:
         pass
     finally:
-        reader_task.cancel()
-        try:
-            await reader_task
-        except (asyncio.CancelledError, Exception):  # noqa: BLE001
-            pass
-        # 清理子进程（整个进程组）。
-        # 注意：交互式 bash 默认忽略 SIGTERM，必须用 SIGKILL 才能确保回收。
-        try:
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        except Exception:  # noqa: BLE001
-            pass
-        # 移除活跃 PTY 跟踪条目
-        _entries = _active_pty.get(session_id, [])
-        if _entry in _entries:
-            _entries.remove(_entry)
-        if not _entries:
-            _active_pty.pop(session_id, None)
-        try:
-            proc.wait(timeout=1)
-        except Exception:  # noqa: BLE001
-            proc.kill()
-        try:
-            os.close(master_fd)
-        except OSError:
-            pass
-        logger.info("[qwenpaw-web-terminal] PTY session %s closed", session_id)
+        # 只清理当前连接的引用；进程保留后台运行（会话持久化）
+        if entry.get("ws") is ws:
+            entry["ws"] = None
+            entry["connected"] = False
+            entry["last_activity"] = time.time()
+            logger.info(
+                "[qwenpaw-web-terminal] PTY session %s detached (pid=%s) — 后台保留",
+                session_id,
+                proc.pid,
+            )
 
 
 class WebTerminalPlugin:
@@ -384,7 +535,12 @@ class WebTerminalPlugin:
         )
 
     async def _shutdown(self) -> None:
-        logger.info("[qwenpaw-web-terminal] Plugin stopped")
+        """主服务退出时清理所有遗留 PTY 进程，避免孤儿 bash。"""
+        killed = 0
+        for sid in list(_pty_store.keys()):
+            if _kill_pty(sid):
+                killed += 1
+        logger.info("[qwenpaw-web-terminal] Plugin stopped, killed %s pty", killed)
 
 
 # REQUIRED: 模块级 plugin 实例

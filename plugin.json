@@ -1,8 +1,8 @@
 {
   "id": "qwenpaw-web-terminal",
   "name": "Web 终端",
-  "version": "0.0.1",
-  "description": "浏览器终端窗口插件 v0.0.1：多标签（每标签独立 PTY，关闭标签即结束终端）+ xterm.js 渲染（ANSI/光标/Tab 补全/复制粘贴）+ 单条命令执行（exec）+ WebSocket 交互式 PTY + 多会话 + 自动重连 + 惰性连接（切到终端页不再自动创建 bash 进程）",
+  "version": "0.1.0",
+  "description": "浏览器终端窗口插件 v0.1.0：多标签（每标签独立 PTY，关闭标签即结束终端）+ xterm.js 渲染（ANSI/光标/Tab 补全/复制粘贴）+ 单条命令执行（exec）+ WebSocket 交互式 PTY + 会话持久化（刷新/断网后台保留，可重新 attach）+ 会话管理面板（查看/打开/结束/清理）+ 多会话 + 自动重连 + 惰性连接",
   "author": "QwenPaw QA Agent",
   "license": "Apache-2.0",
   "type": "app",
