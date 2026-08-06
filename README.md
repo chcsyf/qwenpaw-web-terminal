@@ -55,12 +55,19 @@ ui/
 ## 安装 / 升级
 
 ```bash
+# 发布前校验（可选但建议）
 qwenpaw plugin validate ./qwenpaw-web-terminal
-qwenpaw plugin uninstall qwenpaw-web-terminal   # 已有旧版时先卸载
-qwenpaw plugin install ./qwenpaw-web-terminal
+# 安装 / 覆盖更新（QwenPaw 运行中走 API 热装，无需重启）
+qwenpaw plugin install ./qwenpaw-web-terminal --force
 ```
 
-刷新 QwenPaw 页面，「设置」菜单或应用中心可见「🖥️ 终端」。
+> 注意：不要用 `uninstall` + `install` 两步走——`uninstall` 有交互确认
+> （`click.confirm`），在脚本 / 非交互环境下会卡住，且旧版未卸载时
+> `install` 会因 id 已存在而拒绝。`--force` 一步完成覆盖更新（rmtree
+> 旧目录 → 复制新目录），非交互环境不卡。
+
+刷新 QwenPaw 页面，侧边栏/设置菜单出现「🖥️ 终端」入口，点击进入 `/apps/qwenpaw-web-terminal`。
+平台（platform.agentscope.io）部署：在插件管理页面上传 zip 即可。
 
 ## 目录结构
 
