@@ -534,7 +534,7 @@
       activateTab(id);
       var tab = getTab(id);
       initTermIfNeeded(tab);
-      // 惰性连接（文档 v0.0.1）：切换标签不自动连接，仅输入/点「重连」触发；
+      // 惰性连接：切换标签不自动连接，仅输入/点「重连」触发；
       // 需要 attach 的场景（打开已存在会话/管理面板打开）由调用方显式 ensureConnected
       setTimeout(function () { fitFor(tab); }, 30);
     }
@@ -570,7 +570,7 @@
                 tab.cwd = dr.cwd || '';
                 // 新标签继承当前激活标签的模式；未开始前仍可自由切换（开始后锁定）
                 tab.mode = activeIdRef.current ? getTab(activeIdRef.current).mode : 'pty';
-                // 新建全新会话：惰性连接（文档 v0.0.1——仅输入/点重连触发连接）
+                // 新建全新会话：惰性连接（仅输入/点重连触发连接）
                 createTab(name);
                 if (fromMgr) refreshMgr();
               } else {
@@ -768,7 +768,7 @@
           var sessMap = {};
           list.forEach(function (s) { sessMap[s.id] = s; });
           var agentId = agentHeaders()['X-Agent-Id'] || 'default';
-          // 按文档 v0.0.1：进入终端页自动创建一个与当前智能体同名的默认标签，
+          // 进入终端页自动创建一个与当前智能体同名的默认标签，
           // 但不自动创建 bash 进程（惰性连接，仅输入/点重连触发）；
           // 刷新/断网后除该默认标签外，其他会话全部留在后台（管理面板可见）。
           // 若该默认会话已在后台运行 → 改为打开（attach 原进程，不重复创建）。

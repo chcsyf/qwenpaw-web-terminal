@@ -541,7 +541,7 @@ async def pty_ws(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        # 只清理当前连接的引用；进程保留后台运行（会话持久化，与文档 v0.1.0 一致）
+        # 只清理当前连接的引用；进程保留后台运行（会话持久化）
         if entry.get("ws") is ws:
             entry["ws"] = None
             entry["connected"] = False
