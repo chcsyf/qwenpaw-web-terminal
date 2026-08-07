@@ -36,7 +36,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.1.1"
+PLUGIN_VERSION = "0.1.2"
 
 router = APIRouter()
 
@@ -407,18 +407,11 @@ async def _reaper_loop() -> None:
                 await entry["ws"].close(code=1001)
             except Exception:  # noqa: BLE001
                 pass
-            if sid == "default":
-                # default 不持久化：清理死连接时直接结束进程（handler finally 可能
-                # 因 ws 已被置空而跳过，此处兜底；_kill_pty 幂等）
-                logger.info(
-                    "[qwenpaw-web-terminal] PTY session default stale ws closed — 结束进程"
-                )
-                _kill_pty(sid)
-            else:
-                # handler 的 finally 会清理；此处兜底避免竞态窗口
-                entry["ws"] = None
-                entry["connected"] = False
-                entry["last_activity"] = time.time()
+            # 死连接清理：进程保留后台（会话持久化）；handler 的 finally 会清理，
+            # 此处兜底避免竞态窗口
+            entry["ws"] = None
+            entry["connected"] = False
+            entry["last_activity"] = time.time()
 
 
 async def _pty_loop(session_id: str, entry) -> None:
@@ -546,23 +539,16 @@ async def pty_ws(ws: WebSocket):
     except WebSocketDisconnect:
         pass
     finally:
-        # 只清理当前连接的引用；进程保留后台运行（会话持久化）
+        # 只清理当前连接的引用；进程保留后台运行（会话持久化，与文档 v0.1.0 一致）
         if entry.get("ws") is ws:
             entry["ws"] = None
             entry["connected"] = False
             entry["last_activity"] = time.time()
-            if session_id == "default":
-                # default 是兜底会话，不做持久化：断开即结束进程，不进入后台
-                logger.info(
-                    "[qwenpaw-web-terminal] PTY session default detached — 结束进程（default 不做持久会话）"
-                )
-                _kill_pty(session_id)
-            else:
-                logger.info(
-                    "[qwenpaw-web-terminal] PTY session %s detached (pid=%s) — 后台保留",
-                    session_id,
-                    proc.pid,
-                )
+            logger.info(
+                "[qwenpaw-web-terminal] PTY session %s detached (pid=%s) — 后台保留",
+                session_id,
+                proc.pid,
+            )
 
 
 class WebTerminalPlugin:
