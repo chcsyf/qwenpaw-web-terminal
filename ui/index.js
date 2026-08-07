@@ -13,7 +13,7 @@
   var PLUGIN_ID = "qwenpaw-web-terminal";
   var API_BASE = "/api/qwenpaw-web-terminal";
   var FILES_BASE = "/api/plugins/" + PLUGIN_ID + "/files/ui/vendor";
-  var VERSION = "0.1.0";
+  var VERSION = "0.1.3";
 
   // ============ 样式（GitHub Dark） ============
   var S = {
@@ -178,13 +178,12 @@
     var mountsRef = React.useRef({});        // id -> 挂载 DOM
     var tabOrderRef = React.useRef([]);      // 有序 id 数组（镜像 state，供闭包同步读取）
     var activeIdRef = React.useRef(null);    // 当前激活 id（镜像 state）
-    var modeRef = React.useRef('pty');
     var vendorReadyRef = React.useRef(false);
     var toastTimerRef = React.useRef(null);
 
     var [tabOrder, setTabOrder] = React.useState([]);
     var [activeId, setActiveId] = React.useState(null);
-    var [mode, setMode] = React.useState('pty');
+    var [mode, setMode] = React.useState('pty'); // 当前激活标签的模式镜像（每标签独立）
     var [version, setVersion] = React.useState('');
     var [vendorReady, setVendorReady] = React.useState(false);
     var [wsStates, setWsStates] = React.useState({});  // id -> closed|connecting|open
@@ -201,7 +200,10 @@
           id: id,
           term: null, fit: null, ws: null, buf: '',
           cwd: '', wsState: 'closed', pending: '',
-          reconnectCount: 0, reconnectTimer: null
+          reconnectCount: 0, reconnectTimer: null,
+          heartbeatTimer: null,
+          mode: 'pty',      // 每标签独立模式：'pty' | 'exec'
+          started: false    // 是否已开始（PTY 已连接 / 已执行过 exec）——开始后锁定模式
         });
       }
       return tabsRef.current.get(id);
@@ -222,6 +224,7 @@
     function activateTab(id) {
       activeIdRef.current = id;
       setActiveId(id);
+      setMode(getTab(id).mode); // 同步模式镜像（每标签独立）
     }
 
     // ---- 基础写入 ----
@@ -248,6 +251,7 @@
     function runExec(tab, cmd) {
       cmd = cmd.trim();
       if (!cmd) return;
+      tab.started = true; // 已执行过 exec → 模式锁定
       writeTo(tab, '\r\n\x1b[92m$ ' + cmd + '\x1b[0m\r\n');
       tab.buf = '';
       fetch(API_BASE + '/exec', {
@@ -275,18 +279,30 @@
         });
     }
 
-    // ---- 模式切换（全局；影响当前激活标签） ----
+    // ---- 模式切换（每标签独立；已开始的标签锁定，仅新建/未开始的标签可切换） ----
     function switchMode(m) {
-      if (m === modeRef.current) return;
-      modeRef.current = m;
-      setMode(m);
       var tab = activeIdRef.current ? getTab(activeIdRef.current) : null;
       if (!tab) return;
+      if (tab.started) {
+        // 已开始（PTY 已连接 / 已执行过 exec）：模式锁定，不切换
+        showToast('该标签已开始运行，模式已锁定（新建标签可选择模式）');
+        return;
+      }
+      if (m === tab.mode) return;
+      tab.mode = m;
+      setMode(m);
       if (m === 'pty') {
+        // 切到 pty：清屏、保持惰性（不自动连接，等待输入/重连触发）
         tab.buf = '';
-        if (tab.term) tab.term.clear();
-        ensureConnected(tab);
+        if (tab.term) {
+          tab.term.clear();
+          var wsActive = tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING);
+          if (!wsActive) {
+            writeTo(tab, '\x1b[90m○ 未连接 — 输入任意字符或点击「重连」开始交互\x1b[0m\r\n');
+          }
+        }
       } else {
+        // 切到 exec：断开可能存在的 ws、清屏、显示提示符
         closeWsFor(tab);
         tab.buf = '';
         if (tab.term) {
@@ -302,6 +318,10 @@
         clearTimeout(tab.reconnectTimer);
         tab.reconnectTimer = null;
       }
+      if (tab.heartbeatTimer) {
+        clearInterval(tab.heartbeatTimer);
+        tab.heartbeatTimer = null;
+      }
       tab.reconnectCount = 0;
       tab.pendingInput = '';
       if (tab.ws) {
@@ -316,6 +336,10 @@
         clearTimeout(tab.reconnectTimer);
         tab.reconnectTimer = null;
       }
+      if (tab.heartbeatTimer) {
+        clearInterval(tab.heartbeatTimer);
+        tab.heartbeatTimer = null;
+      }
       tab.reconnectCount = 0;
       if (tab.ws) {
         try { tab.ws.close(); } catch (e) { /* ignore */ }
@@ -329,6 +353,7 @@
       ws.onopen = function () {
         if (tab.ws !== ws) return; // 已被替换/主动关闭的旧连接
         tab.reconnectCount = 0;
+        tab.started = true; // PTY 已连接 → 模式锁定
         setTabWsState(tab.id, 'open');
         showToast('已连接交互式终端（' + tab.id + '）');
         // 清除未连接提示行（bash 输出在 onopen 之后才到达，清屏不影响后续输出）
@@ -341,6 +366,12 @@
           tab.pendingInput = '';
         }
         sendResizeFor(tab);
+        // 心跳保活：每 20s 发 ping，服务端据此清理「挂了但没断开」的死连接
+        tab.heartbeatTimer = setInterval(function () {
+          if (tab.ws === ws && ws.readyState === WebSocket.OPEN) {
+            try { ws.send('\x00ping'); } catch (e) { /* ignore */ }
+          }
+        }, 20000);
       };
       ws.onmessage = function (ev) {
         if (tab.ws !== ws) return; // 旧连接的迟到帧一律丢弃
@@ -353,9 +384,13 @@
       };
       ws.onclose = function () {
         if (tab.ws !== ws) return; // 被替换/主动关闭的旧连接：不触发重连
+        if (tab.heartbeatTimer) {
+          clearInterval(tab.heartbeatTimer);
+          tab.heartbeatTimer = null;
+        }
         setTabWsState(tab.id, 'closed');
         showToast('连接已关闭（' + tab.id + '）');
-        if (modeRef.current === 'pty' && tab.reconnectCount < 5) {
+        if (tab.mode === 'pty' && tab.reconnectCount < 5) {
           tab.reconnectCount++;
           var delay = tab.reconnectCount * 1500;
           showToast('将在 ' + (delay / 1000) + ' 秒后自动重连（' + tab.reconnectCount + '/5）...');
@@ -371,7 +406,7 @@
     }
 
     function ensureConnected(tab) {
-      if (modeRef.current !== 'pty') return;
+      if (tab.mode !== 'pty') return;
       if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) return;
       openWsFor(tab);
     }
@@ -397,7 +432,7 @@
         cursorBlink: true,
         fontSize: 13,
         fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace",
-        scrollback: 5000,
+        scrollback: 50000,
         theme: {
           background: '#010409', foreground: '#c9d1d9', cursor: '#58a6ff', cursorAccent: '#010409',
           selectionBackground: 'rgba(56,139,253,0.4)',
@@ -421,17 +456,17 @@
         try { t.write(tab.pending); } catch (e) { /* ignore */ }
         tab.pending = '';
       }
-      if (modeRef.current === 'exec') writePromptTo(tab);
+      if (tab.mode === 'exec') writePromptTo(tab);
 
       // pty 且未连接：显示灰色提示行；连接成功（onopen）后自动清除
       var wsActive = tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING);
-      if (modeRef.current === 'pty' && !wsActive) {
+      if (tab.mode === 'pty' && !wsActive) {
         writeTo(tab, '\x1b[90m○ 未连接 — 输入任意字符或点击「重连」开始交互\x1b[0m\r\n');
       }
 
       // 输入处理：路由到本标签的 ws / buf
       t.onData(function (data) {
-        if (modeRef.current === 'pty') {
+        if (tab.mode === 'pty') {
           if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
             tab.ws.send(data);
           } else if (tab.ws && tab.ws.readyState === WebSocket.CONNECTING) {
@@ -485,7 +520,7 @@
         saveTabs(order);
       }
       activateTab(id);
-      // 渲染后由 useEffect 完成 init + connect
+      // 渲染后由 useEffect 完成 term 初始化；连接保持惰性（仅输入/点「重连」触发）
     }
 
     function switchTab(id) {
@@ -499,8 +534,50 @@
       activateTab(id);
       var tab = getTab(id);
       initTermIfNeeded(tab);
-      ensureConnected(tab);
+      // 惰性连接（文档 v0.0.1）：切换标签不自动连接，仅输入/点「重连」触发；
+      // 需要 attach 的场景（打开已存在会话/管理面板打开）由调用方显式 ensureConnected
       setTimeout(function () { fitFor(tab); }, 30);
+    }
+
+    // 打开或创建会话：同名已存在 → 直接打开（不重置、不重复创建）；否则创建
+    function openOrCreateSession(name, fromMgr) {
+      fetch(API_BASE + '/sessions')
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          var list = (d && d.ok && d.sessions) ? d.sessions : [];
+          var existing = null;
+          list.forEach(function (s) { if (s.id === name) existing = s; });
+          if (existing) {
+            var tab = getTab(name);
+            tab.cwd = existing.cwd || '';
+            tab.mode = 'pty'; // attach 已有会话 → 强制 pty（attach 语义）
+            if (tabOrderRef.current.indexOf(name) < 0) createTab(name);
+            else switchTab(name);
+            ensureConnected(getTab(name));
+            showToast('会话已存在，已打开：' + name);
+            if (fromMgr) refreshMgr();
+            return;
+          }
+          fetch(API_BASE + '/sessions', {
+            method: 'POST',
+            headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
+            body: JSON.stringify({ id: name })
+          })
+            .then(function (r) { return r.json(); })
+            .then(function (dr) {
+              if (dr && dr.ok) {
+                var tab = getTab(name);
+                tab.cwd = dr.cwd || '';
+                // 新标签继承当前激活标签的模式；未开始前仍可自由切换（开始后锁定）
+                tab.mode = activeIdRef.current ? getTab(activeIdRef.current).mode : 'pty';
+                // 新建全新会话：惰性连接（文档 v0.0.1——仅输入/点重连触发连接）
+                createTab(name);
+                if (fromMgr) refreshMgr();
+              } else {
+                window.alert((dr && dr.error) || '创建失败');
+              }
+            });
+        });
     }
 
     function newTab() {
@@ -508,22 +585,7 @@
       if (!name) return;
       name = String(name).trim().replace(/[^a-zA-Z0-9_-]/g, '-');
       if (!name) return;
-      fetch(API_BASE + '/sessions', {
-        method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
-        body: JSON.stringify({ id: name })
-      })
-        .then(function (r) { return r.json(); })
-        .then(function (d) {
-          if (d && d.ok) {
-            var tab = getTab(name);
-            tab.cwd = d.cwd || '';
-            createTab(name);
-            ensureConnected(tab);
-          } else {
-            window.alert((d && d.error) || '创建失败');
-          }
-        });
+      openOrCreateSession(name, false);
     }
 
     function closeTab(id) {
@@ -599,10 +661,26 @@
     function ptyBadge(s) {
       if (!s || !s.pty) return h('span', { style: { color: '#8b949e' } }, '—');
       var p = s.pty;
-      if (!p.running) return h('span', { style: { color: '#8b949e' } }, '空闲');
-      if (p.connected) return h('span', { style: { color: '#3fb950' } }, '● 运行中·已连接');
-      return h('span', { style: { color: '#d29922' } },
+      var inTabs = tabOrderRef.current.indexOf(s.id) >= 0;
+      if (p.connected) return h('span', { style: { color: '#3fb950' } }, '● 前台运行');
+      if (inTabs) return h('span', { style: { color: '#8b949e' } }, '○ 前台空闲');
+      if (p.running) return h('span', { style: { color: '#d29922' } },
         '◉ 后台运行' + (p.buffered ? '（缓冲 ' + fmtBytes(p.buffered) + '）' : ''));
+      return h('span', { style: { color: '#8b949e' } }, '空闲');
+    }
+    function mgrOpenAll() {
+      var list = (mgrData && mgrData.sessions) || [];
+      var notOpen = list.filter(function (s) { return tabOrderRef.current.indexOf(s.id) < 0; });
+      if (!notOpen.length) { showToast('所有会话都已在标签栏'); return; }
+      notOpen.forEach(function (s) {
+        var tab = getTab(s.id);
+        if (!tab.cwd && s.cwd) tab.cwd = s.cwd;
+        tab.mode = 'pty'; // 打开后台会话 → attach，强制 pty
+        createTab(s.id);
+        ensureConnected(getTab(s.id));
+      });
+      refreshMgr();
+      showToast('已打开 ' + notOpen.length + ' 个会话');
     }
     function refreshMgr() {
       setMgrLoading(true);
@@ -618,6 +696,7 @@
     function closeMgr() { setShowMgr(false); }
     function mgrOpenSession(id) {
       var tab = getTab(id);
+      tab.mode = 'pty'; // 打开会话 → attach，强制 pty
       if (tabOrderRef.current.indexOf(id) < 0) createTab(id);
       else switchTab(id);
       ensureConnected(getTab(id));
@@ -641,8 +720,11 @@
     }
     function mgrKillAllIdle() {
       var list = (mgrData && mgrData.sessions) || [];
-      var idle = list.filter(function (s) { return s.pty && s.pty.detached; });
-      if (!idle.length) { showToast('没有后台空闲会话'); return; }
+      // 结束所有「不在前台标签栏」且正在运行的会话（含后台运行与悬空连接）
+      var idle = list.filter(function (s) {
+        return s.pty && s.pty.running && tabOrderRef.current.indexOf(s.id) < 0;
+      });
+      if (!idle.length) { showToast('没有可清理的后台会话'); return; }
       var ids = idle.map(function (s) { return s.id; });
       var p = Promise.resolve();
       ids.forEach(function (id) {
@@ -657,16 +739,8 @@
       if (!name) return;
       name = String(name).trim().replace(/[^a-zA-Z0-9_-]/g, '-');
       if (!name) return;
-      fetch(API_BASE + '/sessions', {
-        method: 'POST',
-        headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
-        body: JSON.stringify({ id: name })
-      })
-        .then(function (r) { return r.json(); })
-        .then(function (d) {
-          if (d && d.ok) { refreshMgr(); showToast('已创建会话：' + name); }
-          else { window.alert((d && d.error) || '创建失败'); }
-        });
+      // 同名已存在 → 直接打开；否则创建（与「＋ 新标签」行为一致）
+      openOrCreateSession(name, true);
     }
 
     // ---- 初始化：加载 vendor ----
@@ -694,37 +768,24 @@
           var sessMap = {};
           list.forEach(function (s) { sessMap[s.id] = s; });
           var agentId = agentHeaders()['X-Agent-Id'] || 'default';
-          // 标签 = 上次打开的（localStorage）；首次进入 = 当前智能体会话（或 default）
-          var saved = loadSavedTabs();
-          var ids;
-          if (saved.length) {
-            ids = saved;
-          } else {
-            ids = [];
-            if (sessMap[agentId]) ids.push(agentId);
-            if (ids.indexOf('default') < 0) ids.push('default');
-          }
+          // 按文档 v0.0.1：进入终端页自动创建一个与当前智能体同名的默认标签，
+          // 但不自动创建 bash 进程（惰性连接，仅输入/点重连触发）；
+          // 刷新/断网后除该默认标签外，其他会话全部留在后台（管理面板可见）。
+          // 若该默认会话已在后台运行 → 改为打开（attach 原进程，不重复创建）。
+          var id = agentId;
+          var tab = getTab(id);
           var cwdInit = {};
-          var order = [];
-          ids.forEach(function (id) {
-            if (!id) return;
-            var tab = getTab(id);
-            if (sessMap[id]) {
-              tab.cwd = sessMap[id].cwd || '';
-              cwdInit[id] = sessMap[id].cwd || '';
-            }
-            if (order.indexOf(id) < 0) order.push(id);
-          });
-          if (order.length) {
-            tabOrderRef.current = order;
-            setTabOrder(order);
-            setCwdMap(function (prev) { return Object.assign({}, prev, cwdInit); });
-            if (activeIdRef.current === null) {
-              var target = order.indexOf(agentId) >= 0 ? agentId : order[0];
-              activateTab(target);
-            }
-          } else {
-            createTab('default');
+          if (sessMap[id]) {
+            tab.cwd = sessMap[id].cwd || '';
+            cwdInit[id] = sessMap[id].cwd || '';
+          }
+          var order = [id];
+          tabOrderRef.current = order;
+          setTabOrder(order);
+          setCwdMap(function (prev) { return Object.assign({}, prev, cwdInit); });
+          activateTab(id);
+          if (sessMap[id] && sessMap[id].pty && sessMap[id].pty.running) {
+            ensureConnected(getTab(id));
           }
         })
         .catch(function () {
@@ -836,6 +897,7 @@
             h('div', {}, [
               h('button', { style: S.mgrBtn, onClick: refreshMgr }, '⟳ 刷新'),
               h('button', { style: Object.assign({}, S.mgrBtn, S.mgrBtnOk), onClick: mgrCreateSession }, '＋ 新建会话'),
+              h('button', { style: S.mgrBtn, onClick: mgrOpenAll }, '打开所有会话'),
               h('button', { style: Object.assign({}, S.mgrBtn, S.mgrBtnDanger), onClick: mgrKillAllIdle }, '结束所有后台会话'),
               h('button', { style: S.mgrBtn, onClick: closeMgr }, '✕ 关闭')
             ])
@@ -852,7 +914,8 @@
             h('tbody', {}, (mgrData.sessions || []).map(function (s) {
               return h('tr', { key: s.id }, [
                 h('td', { style: S.mgrTd }, [
-                  h('div', { style: { fontWeight: 600, color: '#e6edf3' } }, s.id),
+                  h('div', { style: { fontWeight: 600, color: '#e6edf3' } },
+                    (tabOrderRef.current.indexOf(s.id) >= 0 ? '📌 ' : '') + s.id),
                   h('div', { style: { color: '#8b949e', maxWidth: '320px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, s.cwd || '~')
                 ]),
                 h('td', { style: S.mgrTd }, ptyBadge(s)),

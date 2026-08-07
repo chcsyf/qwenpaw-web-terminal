@@ -10,8 +10,8 @@ Web 终端插件 v0.1.0 - QwenPaw
   - WS     /api/qwenpaw-web-terminal/ws?session=x      交互式 PTY（bash，OSC 7 上报 cwd）
 
 v0.1.0 新增（会话持久化）：
-  - WS 意外断开（刷新/断网）不再 kill PTY 进程，进程转入后台保留，输出写入环形缓冲；
-    重新连接同会话自动 attach 并回放缓冲。正常关闭标签由前端显式 DELETE/kill 结束。
+  - WS 意外断开（刷新/断网）不再 kill PTY 进程，进程转入后台保留，输出写入历史缓冲；
+    重新连接同会话自动 attach 并回放完整历史。正常关闭标签由前端显式 DELETE/kill 结束。
   - GET /sessions 返回每个会话的 PTY 状态（运行/已连接/后台运行/缓冲大小），
     配合前端「会话管理」面板进行打开、结束、删除、清理空闲。
 
@@ -36,7 +36,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.1.2"
+PLUGIN_VERSION = "0.1.3"
 
 router = APIRouter()
 
@@ -59,13 +59,13 @@ _sessions: dict = {}  # session_id -> {"cwd": str, "created_at": float}
 #   proc: Popen          交互式 bash 进程
 #   master_fd: int       PTY master fd
 #   ws / connected      当前活跃 WS（无连接时为 None/False = 后台运行中）
-#   loop_task: Task     统一读取循环（connected 时输出到 WS，否则写环形缓冲）
-#   buf: bytes          后台期间输出环形缓冲（上限 _BUF_MAX，attach 时回放）
+#   loop_task: Task     统一读取循环（connected 时输出到 WS，同时写入历史缓冲）
+#   buf: bytes          会话完整输出历史（上限 _BUF_MAX 保留尾部，attach 时全量回放）
 #   created_at / last_activity: float
 _pty_store: dict = {}
-# 会话输出缓冲上限 256KB（保留尾部）：无论连接与否都记录 PTY 输出，
-# attach 时全量回放 → 刷新/重连后终端恢复断点前内容（命令回显、输出、prompt）
-_BUF_MAX = 256 * 1024
+# 会话输出历史缓冲上限 4MB（保留尾部）：无论连接与否都记录 PTY 输出，
+# attach 时全量回放（不清空）→ 刷新/重连后前端清屏 + 回放完整历史
+_BUF_MAX = 4 * 1024 * 1024
 _exec_timeout = 60.0
 # 心跳守护：前端每 20s 发 \x00ping，超时无消息视为死连接（标签冻结/断网/TCP 悬挂）
 _HEARTBEAT_TIMEOUT = 60.0
@@ -270,7 +270,7 @@ async def exec_cmd(req: ExecRequest, request: Request):
 
 # ============ 交互式 PTY（WebSocket + 会话持久化） ============
 def _append_buf(entry, data: bytes) -> None:
-    """写入后台环形缓冲（保留尾部 _BUF_MAX 字节）。"""
+    """写入会话历史缓冲（保留尾部 _BUF_MAX 字节，作为全量历史滚动窗口）。"""
     entry["buf"] = (entry.get("buf", b"") + data)[-_BUF_MAX:]
 
 
@@ -415,10 +415,11 @@ async def _reaper_loop() -> None:
 
 
 async def _pty_loop(session_id: str, entry) -> None:
-    """统一读取循环：PTY 输出 → 活跃 WS（实时）或 环形缓冲（后台保留）。
+    """统一读取循环：PTY 输出 → 活跃 WS（实时）或 历史缓冲（全量保留）。
 
-    - connected 时：输出经 WebSocket 发给前端
-    - 断开期间：写入 entry["buf"]（上限 _BUF_MAX），attach 时由 WS handler 回放
+    - connected 时：输出经 WebSocket 发给前端，同时写入历史缓冲
+    - 断开期间：输出写入 entry["buf"]（全量历史，上限 _BUF_MAX 保留尾部）
+    - attach 时：WS handler 回放 entry["buf"] 完整历史（不清空）
     - 读到 EOF（bash 退出）→ 清理 PTY 记录（会话状态保留，可重新拉起）
     """
     master_fd = entry["master_fd"]
@@ -464,7 +465,7 @@ async def pty_ws(ws: WebSocket):
 
     生命周期：
       - 首次连接：spawn 新 bash；再次连接：若进程存活则 attach 原进程，
-        并回放断开期间缓冲的输出
+        并回放会话完整历史（前端 onopen 已清屏，全量回放不重复）
       - WS 断开（刷新/断网）：进程保留后台运行，输出写入缓冲；
         由管理面板 / kill 接口结束，或关闭标签时前端显式 DELETE
     """
@@ -486,12 +487,13 @@ async def pty_ws(ws: WebSocket):
     entry["connected"] = True
     entry["last_activity"] = time.time()
     entry["last_seen"] = time.time()
-    # 回放会话输出历史（先取+清，再发送：回放期间新输出不会误清）
+    # 回放会话完整历史：不清空 buf（前端 onopen 已清屏，每次连接都全量回放；
+    # 回放期间新输出仍会 append 进 buf，下次连接继续全量回放）
     if entry.get("buf"):
-        _replay = entry["buf"]
-        entry["buf"] = b""
         try:
-            await ws.send_text(_replay.decode("utf-8", errors="replace"))
+            await ws.send_text(
+                entry["buf"].decode("utf-8", errors="replace")
+            )
         except Exception:  # noqa: BLE001
             pass
     # 确保读取循环运行
