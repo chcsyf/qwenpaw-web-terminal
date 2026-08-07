@@ -36,7 +36,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.1.1"
 
 router = APIRouter()
 
@@ -63,8 +63,14 @@ _sessions: dict = {}  # session_id -> {"cwd": str, "created_at": float}
 #   buf: bytes          后台期间输出环形缓冲（上限 _BUF_MAX，attach 时回放）
 #   created_at / last_activity: float
 _pty_store: dict = {}
-_BUF_MAX = 64 * 1024  # 后台输出缓冲上限 64KB（保留尾部）
+# 会话输出缓冲上限 256KB（保留尾部）：无论连接与否都记录 PTY 输出，
+# attach 时全量回放 → 刷新/重连后终端恢复断点前内容（命令回显、输出、prompt）
+_BUF_MAX = 256 * 1024
 _exec_timeout = 60.0
+# 心跳守护：前端每 20s 发 \x00ping，超时无消息视为死连接（标签冻结/断网/TCP 悬挂）
+_HEARTBEAT_TIMEOUT = 60.0
+_REAPER_INTERVAL = 20.0
+_reaper_task: "asyncio.Task | None" = None
 
 
 def _session_cwd(session_id: str = "default") -> str:
@@ -159,10 +165,15 @@ async def list_sessions():
 @router.post("/sessions")
 async def create_session(req: SessionRequest, request: Request):
     """创建（或重置）一个会话，可指定初始 cwd；未指定时默认当前智能体工作区
-    （依据 X-Agent-Id 请求头）。"""
+    （依据 X-Agent-Id 请求头）。
+
+    v0.1.1：幂等——同名会话已存在时直接返回现有状态，不重置 cwd、
+    不重复创建（防止「新建同名终端」破坏正在使用的会话）。"""
     sid = (req.id or "default").strip()
     if not sid:
         return {"ok": False, "error": "会话 id 不能为空"}
+    if sid in _sessions:
+        return {"ok": True, "id": sid, "cwd": _sessions[sid]["cwd"], "existed": True}
     target = req.cwd.strip() or _request_agent_cwd(request)
     target = os.path.expanduser(target)
     if not os.path.isabs(target):
@@ -170,7 +181,7 @@ async def create_session(req: SessionRequest, request: Request):
     if not Path(target).is_dir():
         return {"ok": False, "error": f"目录不存在: {target}"}
     _set_session_cwd(sid, target)
-    return {"ok": True, "id": sid, "cwd": _session_cwd(sid)}
+    return {"ok": True, "id": sid, "cwd": _session_cwd(sid), "existed": False}
 
 
 @router.post("/sessions/{sid}/kill")
@@ -303,6 +314,7 @@ def _spawn_pty(session_id: str, cwd: str):
         "buf": b"",
         "created_at": time.time(),
         "last_activity": time.time(),
+        "last_seen": time.time(),
     }
     _pty_store[session_id] = entry
     logger.info(
@@ -367,6 +379,48 @@ def _cleanup_pty(session_id: str, entry) -> None:
                 pass
 
 
+async def _reaper_loop() -> None:
+    """心跳守护：周期性清理「显示已连接但长时间无任何消息」的死 WS 连接。
+
+    浏览器标签冻结/休眠、断网或页面被强制销毁时，TCP 连接可能悬挂——
+    服务端 receive() 永远阻塞、finally 不执行，导致 connected 残留、
+    管理面板显示「已连接」但实际已无人。前端每 20s 发 \x00ping 保活，
+    超过 _HEARTBEAT_TIMEOUT 无任何消息 → 视为死连接，强制关闭清理。
+    """
+    while True:
+        await asyncio.sleep(_REAPER_INTERVAL)
+        now = time.time()
+        for sid, entry in list(_pty_store.items()):
+            if not (entry.get("connected") and entry.get("ws") is not None):
+                continue
+            last = entry.get("last_seen", now)
+            if now - last <= _HEARTBEAT_TIMEOUT:
+                continue
+            proc = entry.get("proc")
+            logger.info(
+                "[qwenpaw-web-terminal] PTY session %s heartbeat timeout (%.0fs idle) — closing stale ws (pid=%s)",
+                sid,
+                now - last,
+                proc.pid if proc is not None else "?",
+            )
+            try:
+                await entry["ws"].close(code=1001)
+            except Exception:  # noqa: BLE001
+                pass
+            if sid == "default":
+                # default 不持久化：清理死连接时直接结束进程（handler finally 可能
+                # 因 ws 已被置空而跳过，此处兜底；_kill_pty 幂等）
+                logger.info(
+                    "[qwenpaw-web-terminal] PTY session default stale ws closed — 结束进程"
+                )
+                _kill_pty(sid)
+            else:
+                # handler 的 finally 会清理；此处兜底避免竞态窗口
+                entry["ws"] = None
+                entry["connected"] = False
+                entry["last_activity"] = time.time()
+
+
 async def _pty_loop(session_id: str, entry) -> None:
     """统一读取循环：PTY 输出 → 活跃 WS（实时）或 环形缓冲（后台保留）。
 
@@ -388,15 +442,14 @@ async def _pty_loop(session_id: str, entry) -> None:
             if not data:
                 break  # EOF：bash 进程已退出
             entry["last_activity"] = time.time()
+            # 全量历史：无论连接与否都记录，attach 时回放完整内容
+            _append_buf(entry, data)
             if entry.get("connected") and entry.get("ws") is not None:
                 try:
                     await entry["ws"].send_text(data.decode("utf-8", errors="replace"))
                 except Exception:  # noqa: BLE001
-                    # WS 已失效（旧连接关闭竞态）：降级为缓冲
+                    # WS 已失效（旧连接关闭竞态）：降级为仅缓冲
                     entry["connected"] = False
-                    _append_buf(entry, data)
-            else:
-                _append_buf(entry, data)
         await asyncio.sleep(0.02)
     # EOF / fd 错误：进程结束，清理记录（不删除会话状态）
     logger.info(
@@ -439,13 +492,15 @@ async def pty_ws(ws: WebSocket):
     entry["ws"] = ws
     entry["connected"] = True
     entry["last_activity"] = time.time()
-    # 回放后台期间缓冲的输出
+    entry["last_seen"] = time.time()
+    # 回放会话输出历史（先取+清，再发送：回放期间新输出不会误清）
     if entry.get("buf"):
+        _replay = entry["buf"]
+        entry["buf"] = b""
         try:
-            await ws.send_text(entry["buf"].decode("utf-8", errors="replace"))
+            await ws.send_text(_replay.decode("utf-8", errors="replace"))
         except Exception:  # noqa: BLE001
             pass
-        entry["buf"] = b""
     # 确保读取循环运行
     if entry.get("loop_task") is None or entry["loop_task"].done():
         entry["loop_task"] = asyncio.create_task(_pty_loop(session_id, entry))
@@ -476,12 +531,14 @@ async def pty_ws(ws: WebSocket):
                     pass
                 continue
             if text == "\x00ping":
+                entry["last_seen"] = time.time()  # 心跳：证明连接仍活跃
                 try:
                     await ws.send_text("\x00pong")
                 except Exception:  # noqa: BLE001
                     break
                 continue
             entry["last_activity"] = time.time()
+            entry["last_seen"] = time.time()
             try:
                 os.write(entry["master_fd"], text.encode("utf-8"))
             except OSError:
@@ -494,11 +551,18 @@ async def pty_ws(ws: WebSocket):
             entry["ws"] = None
             entry["connected"] = False
             entry["last_activity"] = time.time()
-            logger.info(
-                "[qwenpaw-web-terminal] PTY session %s detached (pid=%s) — 后台保留",
-                session_id,
-                proc.pid,
-            )
+            if session_id == "default":
+                # default 是兜底会话，不做持久化：断开即结束进程，不进入后台
+                logger.info(
+                    "[qwenpaw-web-terminal] PTY session default detached — 结束进程（default 不做持久会话）"
+                )
+                _kill_pty(session_id)
+            else:
+                logger.info(
+                    "[qwenpaw-web-terminal] PTY session %s detached (pid=%s) — 后台保留",
+                    session_id,
+                    proc.pid,
+                )
 
 
 class WebTerminalPlugin:
@@ -527,6 +591,9 @@ class WebTerminalPlugin:
             api.register_shutdown_hook("qwenpaw_web_terminal_shutdown", self._shutdown)
 
     async def _startup(self) -> None:
+        global _reaper_task
+        if _reaper_task is None or _reaper_task.done():
+            _reaper_task = asyncio.create_task(_reaper_loop())
         logger.info(
             "[qwenpaw-web-terminal] Plugin v%s started - cwd=%s, sessions=%s",
             PLUGIN_VERSION,
@@ -536,6 +603,10 @@ class WebTerminalPlugin:
 
     async def _shutdown(self) -> None:
         """主服务退出时清理所有遗留 PTY 进程，避免孤儿 bash。"""
+        global _reaper_task
+        if _reaper_task is not None:
+            _reaper_task.cancel()
+            _reaper_task = None
         killed = 0
         for sid in list(_pty_store.keys()):
             if _kill_pty(sid):
