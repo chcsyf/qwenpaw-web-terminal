@@ -13,7 +13,7 @@
   var PLUGIN_ID = "qwenpaw-web-terminal";
   var API_BASE = "/api/qwenpaw-web-terminal";
   var FILES_BASE = "/api/plugins/" + PLUGIN_ID + "/files/ui/vendor";
-  var VERSION = "0.1.3";
+  var VERSION = "0.1.4";
 
   // ============ 样式（GitHub Dark） ============
   var S = {
@@ -720,7 +720,7 @@
     }
     function mgrKillAllIdle() {
       var list = (mgrData && mgrData.sessions) || [];
-      // 结束所有「不在前台标签栏」且正在运行的会话（含后台运行与悬空连接）
+      // 结束并删除所有「不在前台标签栏」且正在运行的会话（含后台运行与悬空连接）
       var idle = list.filter(function (s) {
         return s.pty && s.pty.running && tabOrderRef.current.indexOf(s.id) < 0;
       });
@@ -729,10 +729,10 @@
       var p = Promise.resolve();
       ids.forEach(function (id) {
         p = p.then(function () {
-          return fetch(API_BASE + '/sessions/' + encodeURIComponent(id) + '/kill', { method: 'POST' });
+          return fetch(API_BASE + '/sessions/' + encodeURIComponent(id), { method: 'DELETE' });
         });
       });
-      p.then(function () { refreshMgr(); showToast('已结束 ' + ids.length + ' 个后台会话'); });
+      p.then(function () { refreshMgr(); showToast('已结束并删除 ' + ids.length + ' 个后台会话'); });
     }
     function mgrCreateSession() {
       var name = window.prompt('新会话 ID（字母/数字/中划线）：', 's' + Math.floor(Date.now() / 1000).toString(36));
@@ -898,7 +898,7 @@
               h('button', { style: S.mgrBtn, onClick: refreshMgr }, '⟳ 刷新'),
               h('button', { style: Object.assign({}, S.mgrBtn, S.mgrBtnOk), onClick: mgrCreateSession }, '＋ 新建会话'),
               h('button', { style: S.mgrBtn, onClick: mgrOpenAll }, '打开所有会话'),
-              h('button', { style: Object.assign({}, S.mgrBtn, S.mgrBtnDanger), onClick: mgrKillAllIdle }, '结束所有后台会话'),
+              h('button', { style: Object.assign({}, S.mgrBtn, S.mgrBtnDanger), onClick: mgrKillAllIdle }, '结束并删除所有后台会话'),
               h('button', { style: S.mgrBtn, onClick: closeMgr }, '✕ 关闭')
             ])
           ]),
