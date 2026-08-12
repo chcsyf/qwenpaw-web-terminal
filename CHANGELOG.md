@@ -1,13 +1,5 @@
 # 变更记录 (Changelog)
 
-## 未发布（小修复）
-
-- **修复命令卡片闭包 bug（终版）**：AI 回复含多个 ```bash 代码块时，`renderAiMessage` 的
-  `while` 循环里 `cmdText`/`mkClick` 都是 `var`（函数作用域），所有卡片 `onClick` 闭包
-  引用同一变量，点击任何「写入终端/运行」都会执行**最后一条**命令。终版改为每个按钮
-  `onClick` 直接以 IIFE 捕获「当前 cmdText + action」，彻底消除共享变量（经 Node 实测
-  修复前后行为，确认多代码块各自独立）。
-
 ## v0.2.0 - 2026-08-12
 
 - **AI 助手面板**：工具栏「🤖 AI 助手」展开右下角可折叠对话面板
@@ -34,6 +26,11 @@
 - 版本号统一为 0.2.0（plugin.py / ui/index.js / plugin.json / README）
 - 预览图更新为 `qwenpaw-web-terminal.png`，README 图片引用改为 GitHub 绝对链接
   （raw.githubusercontent.com），不再使用相对路径
+- **修复命令卡片闭包 bug**：AI 回复含多个 ```bash 代码块时，`renderAiMessage` 的
+  `while` 循环里 `cmdText`/`mkClick` 都是 `var`（函数作用域），所有卡片 `onClick` 闭包
+  引用同一变量，点击任何「写入终端/运行」都会执行**最后一条**命令。终版改为每个按钮
+  `onClick` 直接以 IIFE 捕获「当前 cmdText + action」，彻底消除共享变量（经 Node 实测
+  修复前后行为，确认多代码块各自独立）。
 
 ## v0.1.4 - 2026-08-07（Bugfix：结束所有后台会话 = 结束并删除）
 
