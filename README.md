@@ -119,7 +119,7 @@ qwenpaw-web-terminal/
 
 ## 变更记录
 
-见 [CHANGELOG.md](CHANGELOG.md)。
+见 [CHANGELOG.md](https://github.com/chcsyf/qwenpaw-web-terminal/blob/main/CHANGELOG.md)。
 
 ## 安全警告
 
