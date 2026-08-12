@@ -1,5 +1,40 @@
 # 变更记录 (Changelog)
 
+## 未发布（小修复）
+
+- **修复命令卡片闭包 bug（终版）**：AI 回复含多个 ```bash 代码块时，`renderAiMessage` 的
+  `while` 循环里 `cmdText`/`mkClick` 都是 `var`（函数作用域），所有卡片 `onClick` 闭包
+  引用同一变量，点击任何「写入终端/运行」都会执行**最后一条**命令。终版改为每个按钮
+  `onClick` 直接以 IIFE 捕获「当前 cmdText + action」，彻底消除共享变量（经 Node 实测
+  修复前后行为，确认多代码块各自独立）。
+
+## v0.2.0 - 2026-08-12
+
+- **AI 助手面板**：工具栏「🤖 AI 助手」展开右下角可折叠对话面板
+  - 发送消息自动附带**当前终端会话内容**（去 ANSI 的最近 400 行/12KB 输出）与当前目录，
+    复用 QwenPaw agent 管线（`workspace.stream_query`）：同一 `session_id` 延续会话历史，
+    支持工具调用/记忆/技能，与主聊天能力一致
+  - SSE 流式渲染（`object: content` 增量事件），**思考过程**以灰色「🤔 思考过程」
+    区块单独展示；发送/停止同一按钮切换（空闲「发送」，生成中「停止」红色）
+  - **命令卡片**：AI 回复中的 ` ```bash ` 代码块渲染为命令卡片，提供四个动作
+    （全部经终端通道，非后端静默执行）：
+    - ✍ **写入终端（不执行）**：PTY 模式经 WS 发送 Ctrl+U 清行 + 命令文本（不回车），
+      用户确认后按回车执行；exec 模式写入输入缓冲
+    - ▶ **运行**：清空输入行 + 写入命令 + 回车，在终端内执行（可见回显/输出，可中断）
+    - 🗑 **清空输入**：向终端发送 Ctrl+U，删除已插入的命令
+    - ⏹ **中断**：向终端发送 Ctrl+C（面板头部也有全局「⏹ 中断」按钮），中断正在执行的命令
+  - **模型选择**：面板顶部下拉可选可用大模型（`GET /ai/models`），选择持久化，
+    通过 `model_slot_override` 按请求切换
+  - **审批处理**：AI 需要权限审批时（tool_guard ASK 模式挂起）面板内轮询
+    `/api/approval/list` 弹「⚠️ 需要审批」卡片，可一键允许/拒绝（`/approve` `/deny`）
+  - **上下文持久化 + 清空**：会话 ID 存 localStorage，刷新后继续同一对话；
+    「🗑 清空」重置会话
+  - 后端新增 `POST /ai/chat`（SSE）与 `GET /ai/models`，从主服务
+    `MultiAgentManager` 获取 workspace，非 QwenPaw 环境返回 503 明确提示
+- 版本号统一为 0.2.0（plugin.py / ui/index.js / plugin.json / README）
+- 预览图更新为 `qwenpaw-web-terminal.png`，README 图片引用改为 GitHub 绝对链接
+  （raw.githubusercontent.com），不再使用相对路径
+
 ## v0.1.4 - 2026-08-07（Bugfix：结束所有后台会话 = 结束并删除）
 
 - **「结束所有后台会话」改为结束并删除**：此前只 kill 进程、会话保留在管理面板

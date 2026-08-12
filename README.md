@@ -1,11 +1,24 @@
-# 🖥️ Web 终端 (qwenpaw-web-terminal) v0.1.4
+# 🖥️ Web 终端 (qwenpaw-web-terminal) v0.2.0
 
-浏览器终端窗口插件：多标签（每标签独立 PTY，关闭标签即结束终端）+ 会话持久化（刷新/断网后台保留，可重新 attach 并回放输出）+ 会话管理面板（查看/打开/结束/清理，同名新建自动打开）+ xterm.js 渲染（ANSI/光标/Tab 补全/复制粘贴）+ 单条命令执行（exec）+ WebSocket 交互式 PTY + 多会话 + 自动重连 + 惰性连接。采用 [Apache License 2.0](LICENSE) 许可协议发布。
+浏览器终端窗口插件：多标签（每标签独立 PTY，关闭标签即结束终端）+ 会话持久化（刷新/断网后台保留，可重新 attach 并回放输出）+ 会话管理面板（查看/打开/结束/清理，同名新建自动打开）+ xterm.js 渲染（ANSI/光标/Tab 补全/复制粘贴）+ 单条命令执行（exec）+ WebSocket 交互式 PTY + 多会话 + 自动重连 + 惰性连接 + **AI 助手面板**（自动读取当前终端内容与目录，生成命令可一键写入终端（不执行）或执行）。采用 [Apache License 2.0](LICENSE) 许可协议发布。
 
 > 由第三方扫雷插件（minesweeper-game）的 app 插件骨架改造而来
 
-## 功能（v0.1.4）
+## 功能（v0.2.0）
 
+- **🤖 AI 助手**：工具栏「🤖 AI 助手」展开右下角可折叠对话面板
+  - 发送消息自动附带**当前终端会话内容**（去 ANSI 的最近 400 行/12KB 输出）与**当前目录**，
+    复用 QwenPaw agent 管线（工具调用/记忆/技能与主聊天一致），SSE 流式渲染，
+    **思考过程**灰色区块单独展示；发送/停止同一按钮切换
+  - **命令卡片**：AI 回复中的 ` ```bash ` 代码块自动渲染为命令卡片，提供四个动作（全部经**终端通道**，非后端静默执行）：
+    - ✍ **写入终端（不执行）**：把命令填入当前终端输入行（PTY 模式经 WS 发送 Ctrl+U 清行 + 命令文本，不回车），
+      用户确认后按回车执行；exec 模式写入输入缓冲
+    - ▶ **运行**：清空输入行 + 写入命令 + 回车，在终端内执行（可见回显/输出，可中断）
+    - 🗑 **清空输入**：向终端发送 Ctrl+U，删除已插入的命令
+    - ⏹ **中断**：向终端发送 Ctrl+C（面板头部也有全局「⏹ 中断」按钮），中断正在执行的命令
+  - **模型选择**：面板顶部下拉可选可用大模型，选择持久化
+  - **审批处理**：AI 需要权限审批时面板内弹卡片，可一键允许/拒绝
+  - **会话持久化**：会话 ID 存 localStorage，刷新后继续同一对话；「🗑 清空」重置会话
 - **多标签**：每个标签一个独立交互式终端（独立 xterm + 独立 WS + 独立 bash PTY）；
   切换标签不中断终端，点击标签上的 × 关闭标签即结束该终端（前端显式 DELETE + 后端 killpg 回收进程）
 - **会话持久化**：WS 意外断开（刷新页面/断网）**不再 kill PTY 进程**——终端转入后台保留，
@@ -42,7 +55,7 @@
 - **自动重连**：WS 断开后 1.5s×N 自动重连（最多 5 次），可手动「重连」
 - **心跳**：WS 支持 `\x00ping` -> `\x00pong`
 
-![qwenpaw-web-terminal-0.0.1](qwenpaw-web-terminal-0.0.1.png)
+![qwenpaw-web-terminal](https://raw.githubusercontent.com/chcsyf/qwenpaw-web-terminal/main/qwenpaw-web-terminal.png)
 
 ## 接口
 
@@ -54,6 +67,8 @@
 | POST | `/api/qwenpaw-web-terminal/sessions/{sid}/kill` | 结束该会话的 PTY 进程（保留会话状态，重连重新拉起） |
 | DELETE | `/api/qwenpaw-web-terminal/sessions/{sid}` | 删除会话（并强制结束该会话活跃/后台 PTY） |
 | POST | `/api/qwenpaw-web-terminal/exec` | `{cmd, session_id?, timeout?}` → `{ok, stdout, stderr, exit_code, cwd}` |
+| POST | `/api/qwenpaw-web-terminal/ai/chat` | AI 对话（SSE 流式）`{text, session_id?, agent_id?, model?}`，复用 QwenPaw agent 管线，自动附带当前终端内容与目录；`model` 为 `"provider_id:model"` 可选切换模型 |
+| GET  | `/api/qwenpaw-web-terminal/ai/models` | 可用模型列表（所有 provider 的预定义+用户添加模型），供 AI 面板下拉选择 |
 | WS   | `/api/qwenpaw-web-terminal/ws?session=default` | 交互式 PTY；文本帧即输入，`\x00resize:cols:rows` 调整窗口，`\x00ping` 心跳 |
 
 > WS 生命周期（v0.1.0）：首次连接 spawn 新 bash；进程存活时再次连接直接 **attach**

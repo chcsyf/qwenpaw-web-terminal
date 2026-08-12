@@ -1,5 +1,5 @@
 """
-Web 终端插件 v0.1.0 - QwenPaw
+Web 终端插件 v0.2.0 - QwenPaw
 浏览器终端窗口：
   - GET    /api/qwenpaw-web-terminal/status            插件状态、版本、cwd（支持 ?session_id=）
   - GET    /api/qwenpaw-web-terminal/sessions          会话列表（含 PTY 运行状态，供管理面板）
@@ -8,6 +8,8 @@ Web 终端插件 v0.1.0 - QwenPaw
   - DELETE /api/qwenpaw-web-terminal/sessions/{sid}    删除会话（并强制结束该会话活跃 PTY）
   - POST   /api/qwenpaw-web-terminal/exec              单条命令执行（sh -c，cd 会话持久）
   - WS     /api/qwenpaw-web-terminal/ws?session=x      交互式 PTY（bash，OSC 7 上报 cwd）
+  - POST   /api/qwenpaw-web-terminal/ai/chat           AI 助手对话（SSE 流式，自动附带当前终端内容）
+  - GET    /api/qwenpaw-web-terminal/ai/models         可用模型列表（AI 面板下拉选择）
 
 v0.1.0 新增（会话持久化）：
   - WS 意外断开（刷新/断网）不再 kill PTY 进程，进程转入后台保留，输出写入历史缓冲；
@@ -20,23 +22,27 @@ v0.1.0 新增（会话持久化）：
 """
 import asyncio
 import fcntl
+import json
 import logging
 import os
 import pty
+import re
 import select
 import signal
 import struct
 import subprocess
 import termios
 import time
+import uuid
 from pathlib import Path
 
-from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.1.4"
+PLUGIN_VERSION = "0.2.0"
 
 router = APIRouter()
 
@@ -266,6 +272,203 @@ async def exec_cmd(req: ExecRequest, request: Request):
         "exit_code": proc.returncode,
         "cwd": cwd,
     }
+
+
+# ============ AI 辅助对话（v0.2.0） ============
+
+class AIChatRequest(BaseModel):
+    """AI 对话请求体。
+
+    text        用户消息正文
+    session_id  终端会话 ID（自动附带该会话的当前内容/目录作为上下文）
+    agent_id    目标 agent（可选，默认 default / X-Agent-Id）
+    model       模型选择（可选，格式 "provider_id:model"，空 = 使用 agent 默认模型）
+    """
+
+    text: str
+    session_id: str = ""
+    agent_id: str = ""
+    model: str = ""
+
+
+# 终端缓冲 → AI 上下文：剥掉 ANSI 转义序列，保留最近若干行
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b\][^\x07]*\x07|\x1b[@-_]")
+_AI_CTX_MAX_LINES = 400
+_AI_CTX_MAX_CHARS = 12000
+
+
+def _terminal_context(session_id: str) -> str:
+    """取会话终端的近期输出作为 AI 上下文（去 ANSI，倒序截取最近行）。"""
+    entry = _pty_store.get(session_id)
+    raw = ""
+    if entry and entry.get("buf"):
+        raw = entry["buf"].decode("utf-8", errors="replace")
+    if not raw:
+        return ""
+    clean = _ANSI_RE.sub("", raw)
+    lines = clean.splitlines()
+    if len(lines) > _AI_CTX_MAX_LINES:
+        lines = lines[-_AI_CTX_MAX_LINES:]
+    text = "\n".join(lines)
+    if len(text) > _AI_CTX_MAX_CHARS:
+        text = text[-_AI_CTX_MAX_CHARS:]
+    return text
+
+
+def _build_ai_prompt(req: AIChatRequest) -> str:
+    """把当前终端会话信息拼进用户提示词。"""
+    parts = []
+    cwd = _session_cwd(req.session_id or "default")
+    parts.append(f"终端会话：{req.session_id or 'default'}")
+    parts.append(f"当前目录：{cwd}")
+    ctx = _terminal_context(req.session_id)
+    if ctx:
+        parts.append("终端当前内容（最近输出，仅供你读取参考，不要重复输出）：\n```\n" + ctx + "\n```")
+    parts.append("---")
+    parts.append(
+        "你是 Web 终端里的 AI 助手。你可以：\n"
+        "1. 读取上面的终端内容，分析输出、解释错误、给出建议；\n"
+        "2. 给出要执行的命令时，把命令放在 ```bash 代码块 里（每行一条）；\n"
+        "   前端会把代码块渲染成命令卡片，用户可「写入终端」（填入输入不执行，回车后执行）、\n"
+        "   「运行」（写入并回车，在终端内执行）、「清空输入」（删除已插入的命令）、\n"
+        "   「中断」（向终端发送 Ctrl+C）——执行始终发生在用户终端里，不是后端静默执行；\n"
+        "3. 不要真的去执行命令，也不要调用工具执行，执行由用户在前端确认（或点「运行」经终端通道执行）。"
+    )
+    parts.append("---")
+    parts.append(req.text.strip())
+    return "\n".join(parts)
+
+
+async def _get_workspace(request: Request, agent_id: str = "") -> object:
+    """从主服务拿 agent workspace（与 QwenPaw 内部路由同一获取方式）。"""
+    if not hasattr(request.app.state, "multi_agent_manager"):
+        raise HTTPException(
+            status_code=503,
+            detail="MultiAgentManager 未初始化，AI 对话不可用",
+        )
+    manager = request.app.state.multi_agent_manager
+    target = agent_id or request.headers.get("X-Agent-Id") or "default"
+    try:
+        workspace = await manager.get_agent(target)
+    except (ValueError, KeyError) as e:
+        raise HTTPException(status_code=404, detail=f"Agent 不存在: {target}") from e
+    except Exception as e:  # noqa: BLE001
+        logger.error("[qwenpaw-web-terminal] get_agent(%s) failed: %s", target, e)
+        raise HTTPException(status_code=500, detail=f"获取 Agent 失败: {e}") from e
+    if workspace is None:
+        raise HTTPException(status_code=404, detail=f"Agent 不存在: {target}")
+    return workspace
+
+
+def _serialize_event(ev: object) -> str:
+    """把 stream_query 产出的 schema 对象序列化为 SSE data 行。"""
+    try:
+        if hasattr(ev, "model_dump"):
+            payload = ev.model_dump()
+        elif isinstance(ev, dict):
+            payload = ev
+        else:
+            payload = {"object": "event", "data": str(ev)}
+    except Exception as e:  # noqa: BLE001
+        payload = {"object": "error", "error": f"序列化失败: {e}"}
+    return "data: " + json.dumps(payload, ensure_ascii=False, default=str) + "\n\n"
+
+
+@router.post("/ai/chat")
+async def ai_chat(
+    req: AIChatRequest,
+    request: Request,
+) -> StreamingResponse:
+    """AI 辅助对话（SSE 流式）。
+
+    复用 QwenPaw agent 管线（workspace.stream_query），同一 session_id 延续
+    会话历史。自动附带当前终端会话的目录与近期输出作为上下文。
+    事件为 QwenPaw 协议对象：
+      {object: "response", status: "created"|"in_progress"|"completed"}
+      {object: "message", role: "assistant", content: [{type:"text", text}]}
+    """
+    workspace = await _get_workspace(request, req.agent_id)
+    session_id = req.session_id or ("qwt-ai-" + uuid.uuid4().hex)
+    prompt = _build_ai_prompt(req)
+
+    async def event_generator():
+        try:
+            stream_req = {
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": prompt}],
+                    }
+                ],
+                "session_id": session_id,
+                "user_id": "qwenpaw-web-terminal",
+                "stream": True,
+            }
+            if req.model and ":" in req.model:
+                stream_req["model_slot_override"] = req.model
+            async for ev in workspace.stream_query(stream_req):
+                yield _serialize_event(ev)
+        except asyncio.CancelledError:
+            logger.info("[qwenpaw-web-terminal] ai/chat cancelled (session=%s)", session_id)
+            raise
+        except Exception as e:  # noqa: BLE001
+            logger.error(
+                "[qwenpaw-web-terminal] ai/chat error (session=%s): %s",
+                session_id,
+                e,
+                exc_info=True,
+            )
+            yield "data: " + json.dumps(
+                {"object": "error", "error": str(e)}, ensure_ascii=False
+            ) + "\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@router.get("/ai/models")
+async def ai_models(request: Request) -> dict:
+    """可用模型列表（供前端下拉选择）。"""
+    try:
+        manager = getattr(request.app.state, "provider_manager", None)
+        if manager is None:
+            return {"ok": True, "models": [], "active": ""}
+        infos = await manager.list_provider_info()
+    except Exception as e:  # noqa: BLE001
+        logger.error("[qwenpaw-web-terminal] ai/models failed: %s", e)
+        return {"ok": True, "models": [], "active": ""}
+
+    models = []
+    for info in infos or []:
+        pid = getattr(info, "id", "") or ""
+        pname = getattr(info, "name", "") or pid
+        if not pid:
+            continue
+        all_models = list(getattr(info, "models", None) or []) + list(
+            getattr(info, "extra_models", None) or []
+        )
+        seen = set()
+        for m in all_models:
+            mid = getattr(m, "id", "") or ""
+            if not mid or mid in seen:
+                continue
+            seen.add(mid)
+            mname = getattr(m, "name", "") or mid
+            models.append({
+                "value": f"{pid}:{mid}",
+                "label": f"{pname} / {mname}",
+                "provider": pname,
+                "model": mname,
+                "is_free": bool(getattr(m, "is_free", False)),
+            })
+    return {"ok": True, "models": models, "active": ""}
 
 
 # ============ 交互式 PTY（WebSocket + 会话持久化） ============
