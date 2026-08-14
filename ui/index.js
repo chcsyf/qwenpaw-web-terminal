@@ -157,6 +157,14 @@
       display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px',
       background: '#161b22', borderBottom: '1px solid #30363d', fontSize: 11, color: '#8b949e'
     },
+    aiCmdLang: {
+      background: 'rgba(110,118,129,0.15)', border: '1px solid rgba(110,118,129,0.3)',
+      borderRadius: 4, padding: '0 6px', fontSize: 10, color: '#8b949e', lineHeight: '16px'
+    },
+    aiCmdCopy: {
+      padding: '1px 8px', borderRadius: 4, border: '1px solid #30363d',
+      background: '#21262d', color: '#c9d1d9', cursor: 'pointer', fontSize: 10, lineHeight: '16px'
+    },
     aiCmdBody: {
       padding: '6px 8px', color: '#e6edf3', fontSize: 12,
       fontFamily: "'JetBrains Mono', 'Fira Code', Menlo, Consolas, monospace",
@@ -199,6 +207,71 @@
     return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
   }
 
+  // ---- 复制文本（剪贴板，失败退回 prompt） ----
+  // 顶层函数（命令卡片使用），不依赖组件内 showToast：复制成功时仅静默完成，
+  // 失败（剪贴板不可用）时退回 prompt 由用户手动复制。
+  function copyText(txt) {
+    if (!txt) return;
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(txt).catch(function () {
+        window.prompt('复制以下文本：', txt);
+      });
+    } else {
+      window.prompt('复制以下文本：', txt);
+    }
+  }
+
+  // ---- bash/shell 命令高亮（与官方代码块视觉语言对齐：主题化 + 语法着色） ----
+  // 返回 React 元素数组，按行渲染。高亮规则：行首 # 注释、引号字符串、${var}/$var、
+  // -x/--xxx 选项、内置关键字（echo/cd/ls/cat 等）与命令首词。未匹配部分保持默认色。
+  var SH_KEYWORDS = {};
+  ("echo cd ls cat grep sed awk curl wget git python pip pip3 npm node bash sh sudo apt apt-get " +
+   "docker docker-compose make cmake gcc g++ java javac mvn go cargo rustc ruby gem bundle rake " +
+   "tar unzip zip mv cp rm mkdir rmdir touch chmod chown ln find xargs sort uniq head tail less more " +
+   "export source alias unalias history kill pkill ps top htop systemctl journalctl service ping " +
+   "ssh scp rsync telnet nc ifconfig ip route env set unset read sleep date time which whereis man " +
+   "clear exit true false test pushd popd").split(/\s+/).forEach(function (w) { SH_KEYWORDS[w] = 1; });
+
+  function renderShHighlight(src) {
+    var esc = escapeHtml;
+    var segs = [];
+    // 按行处理，保留 \n
+    var lines = String(src || '').split('\n');
+    for (var li = 0; li < lines.length; li++) {
+      var line = lines[li];
+      var out = [];
+      // 行首注释
+      var m = line.match(/^\s*#.*/);
+      if (m) {
+        out.push('<span style="color:#8b949e">' + esc(m[0]) + '</span>');
+        segs.push(out.join(''));
+        continue;
+      }
+      // 遍历 token：引号串 / 注释 / 变量 / 选项 / 关键字 / 普通词
+      var re = /("(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*'|`(?:[^`\\]|\\.)*`|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|#[^\n]*|-[A-Za-z][A-Za-z0-9-]*|--[A-Za-z][A-Za-z0-9-]*|\S+)/g;
+      var last = 0;
+      while ((m = re.exec(line)) !== null) {
+        var t = m[0];
+        if (m.index > last) out.push(esc(line.slice(last, m.index)));
+        var cls = '';
+        var c = t[0];
+        if (c === '"' || c === "'" || c === '`') cls = 'color:#a5d6ff';            // 字符串
+        else if (c === '$') cls = 'color:#ff7b72';                                  // 变量
+        else if (c === '#') cls = 'color:#8b949e';                                  // 注释
+        else if ((t[0] === '-' && t.length > 1) && (t[1] !== '-' || t.length > 2)) cls = 'color:#79c0ff'; // 选项
+        else if (SH_KEYWORDS[t]) cls = 'color:#d2a8ff;font-weight:600';             // 内置关键字
+        else if (out.length === 0 && !/^[|;&><]$/.test(t)) cls = 'color:#ffa657';   // 命令首词
+        out.push(cls ? '<span style="' + cls + '">' + esc(t) + '</span>' : esc(t));
+        last = m.index + t.length;
+      }
+      if (last < line.length) out.push(esc(line.slice(last)));
+      segs.push(out.join(''));
+    }
+    return segs.map(function (html, idx) {
+      return h('div', { key: 'sh' + idx, dangerouslySetInnerHTML: { __html: html } });
+    });
+  }
+
   // ---- AI 消息渲染：简化 Markdown + 代码块转命令卡片 ----
   // 返回 React 元素数组。代码块（```bash/```sh/```console/```shell 等）渲染为
   // 命令卡片，提供「写入终端（不执行）/ 运行 / 清空输入 / 中断」按钮；其余按简化 Markdown 渲染。
@@ -227,10 +300,17 @@
             key: 'c' + out.length,
             style: S.aiCmd
           }, [
-            h('div', { style: S.aiCmdHead },
+            h('div', { style: S.aiCmdHead }, [
               h('span', {}, '💻 命令'),
-              h('span', { style: { marginLeft: 'auto' } }, (fm[1] || 'shell'))),
-            h('div', { style: S.aiCmdBody }, cmdText),
+              h('span', { style: S.aiCmdLang }, (fm[1] || 'shell')),
+              h('span', { style: { marginLeft: 'auto' } }),
+              h('button', {
+                style: S.aiCmdCopy,
+                title: '复制命令全文',
+                onClick: (function (cmd) { return function () { copyText(cmd); }; })(cmdText)
+              }, '📋 复制')
+            ]),
+            h('div', { style: S.aiCmdBody }, renderShHighlight(cmdText)),
             h('div', { style: S.aiCmdBtns }, [
               h('button', {
                 style: Object.assign({}, S.aiCmdBtn, S.aiCmdBtnWarn),
