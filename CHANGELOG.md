@@ -1,5 +1,18 @@
 # 变更记录 (Changelog)
 
+## v0.2.2 - 2026-08-15
+
+- **AI 面板模型下拉只显示可用大模型**：`GET /ai/models` 过滤未配置 API key 的 provider
+  （github-models/modelscope/dashscope/openai/anthropic/gemini 等官方预置但未配 key 的
+  不再出现），仅保留已配置 key / 本地 / 免 key / OAuth 已连接的 provider
+- **命令卡片按钮 UI 优化**：
+  - 按钮区保持单行四按钮，按钮内部改为「图标 + 文字」横排：图标 15px、文字 9px，
+    文字过长自动换行，按钮整体更紧凑
+  - 「✍ 写入终端（不执行）」按钮文案改为 **「✍ 插入脚本」**（行为不变：填入终端
+    输入行不回车，确认后回车执行），toast/面板说明同步更新
+- 前端 VERSION 常量同步至 0.2.2（修复 v0.2.1 发布时未同步的滞后）
+- 版本号统一为 0.2.2（plugin.py / plugin.json / README）
+
 ## v0.2.1 - 2026-08-14
 
 - **命令卡片对齐官方代码块视觉语言（#6911）**：

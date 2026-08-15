@@ -13,7 +13,7 @@
   var PLUGIN_ID = "qwenpaw-web-terminal";
   var API_BASE = "/api/qwenpaw-web-terminal";
   var FILES_BASE = "/api/plugins/" + PLUGIN_ID + "/files/ui/vendor";
-  var VERSION = "0.2.0";
+  var VERSION = "0.2.2";
 
   // ============ 样式（GitHub Dark） ============
   var S = {
@@ -172,8 +172,9 @@
     },
     aiCmdBtns: { display: 'flex', gap: 6, padding: '6px 8px', borderTop: '1px solid #21262d', background: '#161b22' },
     aiCmdBtn: {
-      padding: '3px 10px', borderRadius: 4, border: '1px solid #30363d',
-      background: '#21262d', color: '#c9d1d9', cursor: 'pointer', fontSize: 11
+      flex: 1, display: 'flex', flexDirection: 'row', alignItems: 'center', justifyContent: 'center',
+      gap: 4, padding: '4px 6px', borderRadius: 4, border: '1px solid #30363d',
+      background: '#21262d', color: '#c9d1d9', cursor: 'pointer', textAlign: 'center'
     },
     aiCmdBtnWarn: { background: 'rgba(210,153,34,0.12)', borderColor: '#d29922', color: '#d29922' },
     aiCmdBtnRun: { background: 'rgba(63,185,80,0.12)', borderColor: '#3fb950', color: '#3fb950' }
@@ -274,7 +275,7 @@
 
   // ---- AI 消息渲染：简化 Markdown + 代码块转命令卡片 ----
   // 返回 React 元素数组。代码块（```bash/```sh/```console/```shell 等）渲染为
-  // 命令卡片，提供「写入终端（不执行）/ 运行 / 清空输入 / 中断」按钮；其余按简化 Markdown 渲染。
+  // 命令卡片，提供「插入脚本 / 运行 / 清空输入 / 中断」按钮；其余按简化 Markdown 渲染。
   function renderAiMessage(text, onCmd) {
     var out = [];
     var lines = String(text || '').split('\n');
@@ -314,24 +315,36 @@
             h('div', { style: S.aiCmdBtns }, [
               h('button', {
                 style: Object.assign({}, S.aiCmdBtn, S.aiCmdBtnWarn),
-                title: '写入终端输入行（不执行），确认后按回车执行',
+                title: '插入脚本到终端输入行（不执行），确认后按回车执行',
                 onClick: (function (cmd) { return function () { onCmd(cmd, 'type'); }; })(cmdText)
-              }, '✍ 写入终端（不执行）'),
+              }, [
+                h('span', { style: { fontSize: 15, lineHeight: 1, flexShrink: 0 } }, '✍'),
+                h('span', { style: { fontSize: 9, lineHeight: 1.35, wordBreak: 'break-word' } }, '插入脚本')
+              ]),
               h('button', {
                 style: Object.assign({}, S.aiCmdBtn, S.aiCmdBtnRun),
                 title: '写入终端输入行并回车，在终端内执行（可见回显，Ctrl+C 可中断）',
                 onClick: (function (cmd) { return function () { onCmd(cmd, 'run'); }; })(cmdText)
-              }, '▶ 运行'),
+              }, [
+                h('span', { style: { fontSize: 15, lineHeight: 1, flexShrink: 0 } }, '▶'),
+                h('span', { style: { fontSize: 9, lineHeight: 1.35, wordBreak: 'break-word' } }, '运行')
+              ]),
               h('button', {
                 style: Object.assign({}, S.aiCmdBtn, S.aiCmdBtnWarn),
                 title: '清空已插入的终端输入（Ctrl+U）',
                 onClick: function () { onCmd('', 'clear'); }
-              }, '🗑 清空输入'),
+              }, [
+                h('span', { style: { fontSize: 15, lineHeight: 1, flexShrink: 0 } }, '🗑'),
+                h('span', { style: { fontSize: 9, lineHeight: 1.35, wordBreak: 'break-word' } }, '清空输入')
+              ]),
               h('button', {
                 style: Object.assign({}, S.aiCmdBtn),
                 title: '中断终端当前执行（Ctrl+C）',
                 onClick: function () { onCmd('', 'intr'); }
-              }, '⏹ 中断')
+              }, [
+                h('span', { style: { fontSize: 15, lineHeight: 1, flexShrink: 0 } }, '⏹'),
+                h('span', { style: { fontSize: 9, lineHeight: 1.35, wordBreak: 'break-word' } }, '中断')
+              ])
             ])
           ]));
         } else {
@@ -1114,7 +1127,7 @@
     }
 
     // AI 命令卡片操作（全部作用于当前激活终端，经终端通道，非后端静默执行）：
-    //   type  = 写入终端（不执行）：清空输入行（Ctrl+U）→ 写入命令（不回车），用户确认后回车执行
+    //   type  = 插入脚本（不执行）：清空输入行（Ctrl+U）→ 写入命令（不回车），用户确认后回车执行
     //   run   = 写入并运行：清空输入行 → 写入命令 + 回车，在终端内执行（可见回显/输出，可中断）
     //   intr  = 中断：向终端发送 Ctrl+C（\x03），中断当前执行
     //   clear = 清空已插入的输入（发送 Ctrl+U）
@@ -1131,7 +1144,7 @@
             tab.term.write('\r\n' + cmd);
             writePromptTo(tab);
           }
-          showToast('已写入终端输入（按回车执行）');
+          showToast('已插入脚本（按回车执行）');
         } else if (action === 'clear') {
           tab.buf = '';
           if (tab.term) { tab.term.write('\r\n'); writePromptTo(tab); }
@@ -1145,7 +1158,7 @@
       if (action === 'type') {
         // Ctrl+U（\x15）清空当前输入行 → 写入命令（不回车）
         ptySend(tab, '\x15' + cmd);
-        showToast('已写入终端输入（不执行，按回车执行；「清空」可删除）');
+        showToast('已插入脚本（不执行，按回车执行；「清空」可删除）');
       } else if (action === 'run') {
         // 清空输入行 → 写入命令 + 回车，在终端内执行
         ptySend(tab, '\x15' + cmd + '\r');
@@ -1544,7 +1557,7 @@
           }) : null,
           aiMsgs.length === 0
             ? h('div', { style: S.aiEmpty },
-                '与 AI 对话，发送时自动附带：\n· 当前终端会话内容（去 ANSI 的最近输出）\n· 当前目录\n\nAI 给出的命令会渲染成卡片：\n✍ 写入终端（不执行）＝填入输入，回车后执行\n▶ 运行＝写入并回车，在终端内执行\n🗑 清空输入＝删除已插入的命令\n⏹ 中断＝Ctrl+C 中断终端执行\n\n对话上下文会保留（刷新不丢失），\n「🗑 清空」可重置会话')
+                '与 AI 对话，发送时自动附带：\n· 当前终端会话内容（去 ANSI 的最近输出）\n· 当前目录\n\nAI 给出的命令会渲染成卡片：\n✍ 插入脚本＝填入输入，回车后执行\n▶ 运行＝写入并回车，在终端内执行\n🗑 清空输入＝删除已插入的命令\n⏹ 中断＝Ctrl+C 中断终端执行\n\n对话上下文会保留（刷新不丢失），\n「🗑 清空」可重置会话')
             : aiMsgs.map(function (m, i) {
                 if (m.role === 'user') {
                   return h('div', { key: i, style: S.aiRowUser },
