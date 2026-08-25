@@ -1,5 +1,5 @@
 """
-Web 终端插件 v0.2.0 - QwenPaw
+Web 终端插件 v0.2.3 - QwenPaw
 浏览器终端窗口：
   - GET    /api/qwenpaw-web-terminal/status            插件状态、版本、cwd（支持 ?session_id=）
   - GET    /api/qwenpaw-web-terminal/sessions          会话列表（含 PTY 运行状态，供管理面板）
@@ -8,8 +8,18 @@ Web 终端插件 v0.2.0 - QwenPaw
   - DELETE /api/qwenpaw-web-terminal/sessions/{sid}    删除会话（并强制结束该会话活跃 PTY）
   - POST   /api/qwenpaw-web-terminal/exec              单条命令执行（sh -c，cd 会话持久）
   - WS     /api/qwenpaw-web-terminal/ws?session=x      交互式 PTY（bash，OSC 7 上报 cwd）
+  - GET    /api/qwenpaw-web-terminal/stream?session=x  SSE 输出流（WS 被网关剥升级头时的降级通道；
+                                                       data 行为 base64(UTF-8)，注释行 : ping 保活）
+  - POST   /api/qwenpaw-web-terminal/input             SSE 模式输入通道 {session_id, data}
+                                                       （data 兼容 WS 控制协议：\x00resize:c:r / \x00ping）
   - POST   /api/qwenpaw-web-terminal/ai/chat           AI 助手对话（SSE 流式，自动附带当前终端内容）
   - GET    /api/qwenpaw-web-terminal/ai/models         可用模型列表（AI 面板下拉选择）
+
+v0.2.3 新增（SSE 降级传输）：
+  - 部分平台网关反向代理不透传 WebSocket Upgrade 头 → 后端把握手当普通 GET 返回 404，
+    前端表现为「一直重连」。新增纯 HTTP 的降级通道：GET /stream（SSE 下行）+ POST /input（上行）。
+  - 前端 WS 握手首次失败自动切换 SSE 并记忆偏好（localStorage），本地/正常环境零影响仍走 WS。
+  - SSE 与 WS 共用同一 PTY 会话与历史缓冲：会话持久化、全量回放、OSC7 cwd 上报语义不变。
 
 v0.1.0 新增（会话持久化）：
   - WS 意外断开（刷新/断网）不再 kill PTY 进程，进程转入后台保留，输出写入历史缓冲；
@@ -21,6 +31,7 @@ v0.1.0 新增（会话持久化）：
 属于高危能力，仅建议在可信环境（本地/内网）使用。
 """
 import asyncio
+import base64
 import fcntl
 import json
 import logging
@@ -42,7 +53,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.2.2"
+PLUGIN_VERSION = "0.2.3"
 
 router = APIRouter()
 
@@ -77,6 +88,9 @@ _exec_timeout = 60.0
 _HEARTBEAT_TIMEOUT = 60.0
 _REAPER_INTERVAL = 20.0
 _reaper_task: "asyncio.Task | None" = None
+# SSE 降级通道：输出轮询间隔 / 网关保活注释帧间隔
+_SSE_POLL = 0.08
+_SSE_KEEPALIVE = 15.0
 
 
 def _session_cwd(session_id: str = "default") -> str:
@@ -771,6 +785,110 @@ async def pty_ws(ws: WebSocket):
                 session_id,
                 proc.pid,
             )
+
+
+# ============ SSE 降级传输（网关不支持 WebSocket 升级时使用） ============
+def _sse_frame(data: bytes) -> str:
+    """终端输出 → SSE data 帧。base64 编码：字节精确、可含任意控制字符/换行，
+    前端用流式 TextDecoder 解码（跨 chunk 的多字节字符安全）。"""
+    return "data: " + base64.b64encode(data).decode("ascii") + "\n\n"
+
+
+@router.get("/stream")
+async def pty_stream(request: Request, session: str = "default"):
+    """SSE 下行通道：PTY 输出流（base64 data 帧）。
+
+    - 复用与 WS 完全相同的会话/PTY/历史缓冲：首次连接 spawn，断线重连全量回放
+    - 不占用 entry.ws/connected（与 WS 互不干扰；reaper 只管 WS 死连接）
+    - 每 _SSE_KEEPALIVE 秒发注释帧 ': ping' 防中间网关空闲超时掐断
+    - PTY 退出（bash 结束）时结束流 → 前端 EventSource 自动重连拉起新 PTY
+    """
+    session_id = session or "default"
+    if session_id not in _sessions:
+        _set_session_cwd(session_id, _request_agent_cwd(request))
+    entry = _attach_or_spawn(session_id)
+    if entry.get("loop_task") is None or entry["loop_task"].done():
+        entry["loop_task"] = asyncio.create_task(_pty_loop(session_id, entry))
+    entry["last_activity"] = time.time()
+    logger.info(
+        "[qwenpaw-web-terminal] PTY session %s attached via SSE (pid=%s)",
+        session_id,
+        entry["proc"].pid,
+    )
+
+    async def gen():
+        try:
+            offset = 0
+            # 全量回放（前端 onopen 已清屏，语义与 WS attach 一致）
+            buf = entry.get("buf") or b""
+            if buf:
+                offset = len(buf)
+                yield _sse_frame(buf)
+            idle = 0.0
+            while True:
+                if await request.is_disconnected():
+                    break
+                if _pty_store.get(session_id) is not entry:
+                    break  # PTY 已退出清理：结束流，EventSource 自动重连重新拉起
+                buf = entry.get("buf") or b""
+                if offset > len(buf):  # 缓冲截断（超 _BUF_MAX 丢头部）：回退重发全量
+                    offset = 0
+                if len(buf) > offset:
+                    data = buf[offset:]
+                    offset = len(buf)
+                    idle = 0.0
+                    yield _sse_frame(data)
+                else:
+                    idle += _SSE_POLL
+                    if idle >= _SSE_KEEPALIVE:
+                        yield ": ping\n\n"
+                        idle = 0.0
+                await asyncio.sleep(_SSE_POLL)
+        except asyncio.CancelledError:
+            pass
+        # 断开/结束：进程保留后台运行（会话持久化），不清理 entry
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+class InputRequest(BaseModel):
+    session_id: str = "default"
+    data: str
+
+
+@router.post("/input")
+async def pty_input(req: InputRequest):
+    """SSE 模式上行通道：键盘输入 / \\x00resize:c:r / \\x00ping（协议与 WS 一致）。"""
+    sid = req.session_id or "default"
+    entry = _attach_or_spawn(sid)
+    if entry.get("loop_task") is None or entry["loop_task"].done():
+        entry["loop_task"] = asyncio.create_task(_pty_loop(sid, entry))
+    text = req.data
+    if text.startswith("\x00resize:"):
+        try:
+            _, cols, rows = text.split(":")
+            fcntl.ioctl(
+                entry["master_fd"],
+                termios.TIOCSWINSZ,
+                struct.pack("HHHH", int(rows), int(cols), 0, 0),
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        return {"ok": True}
+    if text == "\x00ping":
+        entry["last_seen"] = time.time()
+        return {"ok": True, "pong": True}
+    entry["last_activity"] = time.time()
+    entry["last_seen"] = time.time()
+    try:
+        os.write(entry["master_fd"], text.encode("utf-8"))
+    except OSError as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
 
 
 class WebTerminalPlugin:

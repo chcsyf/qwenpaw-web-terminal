@@ -13,7 +13,7 @@
   var PLUGIN_ID = "qwenpaw-web-terminal";
   var API_BASE = "/api/qwenpaw-web-terminal";
   var FILES_BASE = "/api/plugins/" + PLUGIN_ID + "/files/ui/vendor";
-  var VERSION = "0.2.2";
+  var VERSION = "0.2.3";
 
   // ============ 样式（GitHub Dark） ============
   var S = {
@@ -471,6 +471,22 @@
     var [aiApprovals, setAiApprovals] = React.useState([]);
 
     // ---- tab 实例管理 ----
+    var LS_TRANSPORT = 'qwenpaw-web-terminal:transport'; // 'ws' | 'sse' 记忆的传输偏好
+    function getTransportPref() {
+      try { var v = localStorage.getItem(LS_TRANSPORT); if (v === 'ws' || v === 'sse') return v; } catch (e) { /* 忽略 */ }
+      return 'auto'; // 未知：先尝试 WS，失败自动降级(并写回偏好)
+    }
+    function setTransportPref(v) {
+      try { if (v === 'ws' || v === 'sse') localStorage.setItem(LS_TRANSPORT, v); } catch (e) { /* 忽略 */ }
+    }
+    // base64(UTF-8) → 文本；用流式 TextDecoder 保证跨 chunk 的多字节字符不损坏
+    function b64ToText(b64) {
+      var bin = atob(b64);
+      var bytes = new Uint8Array(bin.length);
+      for (var i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      return bytes;
+    }
+
     function getTab(id) {
       if (!tabsRef.current.has(id)) {
         tabsRef.current.set(id, {
@@ -480,7 +496,11 @@
           reconnectCount: 0, reconnectTimer: null,
           heartbeatTimer: null,
           mode: 'pty',      // 每标签独立模式：'pty' | 'exec'
-          started: false    // 是否已开始（PTY 已连接 / 已执行过 exec）——开始后锁定模式
+          started: false,   // 是否已开始（PTY 已连接 / 已执行过 exec）——开始后锁定模式
+          transport: getTransportPref(), // 'auto' | 'ws' | 'sse'：本标签当前激活的传输通道
+          sse: null,        // EventSource 实例（sse 模式）
+          sseTried: false,  // 本标签是否已尝试过 SSE（防无限降级往返）
+          dec: new TextDecoder('utf-8') // sse 解码器（流式，跨 chunk 安全）
         });
       }
       return tabsRef.current.get(id);
@@ -580,7 +600,7 @@
         }
       } else {
         // 切到 exec：断开可能存在的 ws、清屏、显示提示符
-        closeWsFor(tab);
+        closeTransportFor(tab);
         tab.buf = '';
         if (tab.term) {
           tab.term.clear();
@@ -589,26 +609,23 @@
       }
     }
 
-    // ---- WebSocket（每个标签独立） ----
-    function closeWsFor(tab) {
-      if (tab.reconnectTimer) {
-        clearTimeout(tab.reconnectTimer);
-        tab.reconnectTimer = null;
-      }
-      if (tab.heartbeatTimer) {
-        clearInterval(tab.heartbeatTimer);
-        tab.heartbeatTimer = null;
-      }
+    // ---- 传输通道（每个标签独立）：优先 WS，网关不支持时降级 SSE ----
+    function closeTransportFor(tab) {
+      stopReconnect(tab);
       tab.reconnectCount = 0;
       tab.pendingInput = '';
       if (tab.ws) {
         try { tab.ws.close(); } catch (e) { /* ignore */ }
         tab.ws = null;
       }
+      if (tab.sse) {
+        try { tab.sse.close(); } catch (e) { /* ignore */ }
+        tab.sse = null;
+      }
       setTabWsState(tab.id, 'closed');
     }
 
-    function openWsFor(tab) {
+    function stopReconnect(tab) {
       if (tab.reconnectTimer) {
         clearTimeout(tab.reconnectTimer);
         tab.reconnectTimer = null;
@@ -617,6 +634,11 @@
         clearInterval(tab.heartbeatTimer);
         tab.heartbeatTimer = null;
       }
+    }
+
+    function openWsFor(tab) {
+      stopReconnect(tab);
+      if (tab.sse) { try { tab.sse.close(); } catch (e) { /* ignore */ } tab.sse = null; }
       tab.reconnectCount = 0;
       if (tab.ws) {
         try { tab.ws.close(); } catch (e) { /* ignore */ }
@@ -629,6 +651,9 @@
       tab.ws = ws;
       ws.onopen = function () {
         if (tab.ws !== ws) return; // 已被替换/主动关闭的旧连接
+        ws._everOpened = true;
+        tab.transport = 'ws';
+        setTransportPref('ws');    // 本地/正常环境：WS 可用，写回偏好
         tab.reconnectCount = 0;
         tab.started = true; // PTY 已连接 → 模式锁定
         setTabWsState(tab.id, 'open');
@@ -661,11 +686,19 @@
       };
       ws.onclose = function () {
         if (tab.ws !== ws) return; // 被替换/主动关闭的旧连接：不触发重连
-        if (tab.heartbeatTimer) {
-          clearInterval(tab.heartbeatTimer);
-          tab.heartbeatTimer = null;
-        }
+        stopReconnect(tab);
         setTabWsState(tab.id, 'closed');
+        // 平台网关可能不透传 WebSocket Upgrade 头 → 后端把握手当普通 GET 返回 404。
+        // 浏览器无法读取该 HTTP 状态码，故以「从未成功 open」判定首次握手失败：
+        // 若偏好允许且尚未尝试 SSE，则降级到 SSE（并记忆偏好），不再原地死循环重连。
+        if (!ws._everOpened && tab.mode === 'pty' && tab.transport !== 'sse') {
+          tab.transport = 'sse';
+          tab.sseTried = true;
+          setTransportPref('sse');
+          showToast('WebSocket 不可用，切换 SSE 模式...');
+          openSseFor(tab);
+          return;
+        }
         showToast('连接已关闭（' + tab.id + '）');
         if (tab.mode === 'pty' && tab.reconnectCount < 5) {
           tab.reconnectCount++;
@@ -676,22 +709,98 @@
       };
       ws.onerror = function () {
         if (tab.ws !== ws) return;
-        // 只提示；重连统一由 onclose 驱动
+        // 只提示；重连/降级统一由 onclose 驱动
         setTabWsState(tab.id, 'closed');
         showToast('连接错误（' + tab.id + '）');
       };
     }
 
+    // ---- SSE 降级通道：下行 EventSource + 上行 fetch(POST /input) ----
+    function openSseFor(tab) {
+      stopReconnect(tab);
+      if (tab.ws) { try { tab.ws.close(); } catch (e) { /* ignore */ } tab.ws = null; }
+      tab.reconnectCount = 0;
+      var url = API_BASE + '/stream?session=' + encodeURIComponent(tab.id);
+      setTabWsState(tab.id, 'connecting');
+      var es = new EventSource(url);
+      tab.sse = es;
+      es.onopen = function () {
+        if (tab.sse !== es) return;
+        tab.started = true;
+        setTabWsState(tab.id, 'open');
+        showToast('已连接交互式终端（SSE 模式，' + tab.id + '）');
+        if (tab.term) {
+          try { tab.term.clear(); } catch (e) { /* ignore */ }
+        }
+        // 补发连接期间暂存的输入
+        if (tab.pendingInput) {
+          sendInput(tab, tab.pendingInput);
+          tab.pendingInput = '';
+        }
+        sendResizeFor(tab);
+      };
+      es.onmessage = function (ev) {
+        if (tab.sse !== es) return;
+        var raw = ev.data;
+        if (typeof raw !== 'string' || raw.indexOf('\x00') === 0) return; // 控制帧忽略
+        if (raw.indexOf('data:') === 0) raw = raw.slice(5);
+        try {
+          var bytes = b64ToText(raw.trim());
+          var text = tab.dec.decode(bytes, { stream: true });
+          if (text) {
+            var parsed = extractOsc7(text);
+            if (parsed.paths.length) setTabCwd(tab.id, parsed.paths[parsed.paths.length - 1]);
+            if (parsed.clean) writeTo(tab, parsed.clean);
+          }
+        } catch (e) { /* 忽略坏帧 */ }
+      };
+      es.onerror = function () {
+        // EventSource 内置自动重连；此处仅同步 UI 状态
+        if (tab.sse !== es) return;
+        setTabWsState(tab.id, tab.started ? 'open' : 'connecting');
+      };
+    }
+
+    // ---- 统一入口：按当前传输通道发送文本（WS 帧 / SSE POST /input 复用同协议） ----
+    function sendInput(tab, data) {
+      if (tab.transport === 'sse' || (tab.transport === 'auto' && tab.sse && !tab.ws)) {
+        fetch(API_BASE + '/input', {
+          method: 'POST',
+          headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
+          body: JSON.stringify({ session_id: tab.id, data: data })
+        }).catch(function () { /* 忽略 */ });
+        return;
+      }
+      // WS 模式（或未知偏好下已建立的 WS）
+      if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+        try { tab.ws.send(data); } catch (e) { /* ignore */ }
+      }
+    }
+
     function ensureConnected(tab) {
       if (tab.mode !== 'pty') return;
+      // 已有活跃连接则不重连
       if (tab.ws && (tab.ws.readyState === WebSocket.OPEN || tab.ws.readyState === WebSocket.CONNECTING)) return;
+      if (tab.sse && tab.started) return;
+      // 偏好 SSE（曾降级过）或已降级 → 直接走 SSE
+      if (tab.transport === 'sse' || (tab.sseTried && !tab.ws)) {
+        tab.transport = 'sse';
+        openSseFor(tab);
+        return;
+      }
       openWsFor(tab);
     }
 
     function sendResizeFor(tab) {
-      if (!tab.ws || tab.ws.readyState !== WebSocket.OPEN) return;
       if (!tab.term) return;
-      try { tab.ws.send('\x00resize:' + tab.term.cols + ':' + tab.term.rows); } catch (e) { /* ignore */ }
+      var msg = '\x00resize:' + tab.term.cols + ':' + tab.term.rows;
+      if (tab.transport === 'sse' || (tab.sse && !tab.ws)) {
+        sendInput(tab, msg);
+        return;
+      }
+      if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
+        try { tab.ws.send(msg); } catch (e) { /* ignore */ }
+      }
     }
 
     function fitFor(tab) {
@@ -741,12 +850,17 @@
         writeTo(tab, '\x1b[90m○ 未连接 — 输入任意字符或点击「重连」开始交互\x1b[0m\r\n');
       }
 
-      // 输入处理：路由到本标签的 ws / buf
+      // 输入处理：路由到本标签的 ws / sse / buf
       t.onData(function (data) {
         if (tab.mode === 'pty') {
-          if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
-            tab.ws.send(data);
-          } else if (tab.ws && tab.ws.readyState === WebSocket.CONNECTING) {
+          var sseLive = tab.transport === 'sse' && tab.started;
+          var wsOpen = tab.ws && tab.ws.readyState === WebSocket.OPEN;
+          var wsConnecting = tab.ws && tab.ws.readyState === WebSocket.CONNECTING;
+          if (wsOpen) {
+            sendInput(tab, data);          // WS 活跃：走统一发送（仍在 WS 帧路径）
+          } else if (sseLive) {
+            sendInput(tab, data);          // SSE 活跃：POST /input
+          } else if (wsConnecting) {
             // 连接中：暂存输入，onopen 后补发
             tab.pendingInput = (tab.pendingInput || '') + data;
           } else {
@@ -868,7 +982,7 @@
     function closeTab(id) {
       var tab = tabsRef.current.get(id);
       if (tab) {
-        closeWsFor(tab);          // 前端主动断开 → 后端 killpg 结束该终端 bash
+        closeTransportFor(tab);   // 前端主动断开 → 后端 killpg 结束该终端 bash
         if (tab.term) {
           try { tab.term.dispose(); } catch (e) { /* ignore */ }
           tab.term = null;
@@ -1113,6 +1227,11 @@
     // ---- 向 PTY 发送输入（未连接时先连接并暂存，连接后补发） ----
     function ptySend(tab, text) {
       if (tab.mode !== 'pty') return false;
+      // SSE 已建立（或已降级偏好）：走统一 POST /input，命中下一轮 SSE 流
+      if (tab.transport === 'sse' && tab.started) {
+        sendInput(tab, text);
+        return true;
+      }
       if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
         try { tab.ws.send(text); } catch (e) { /* ignore */ }
         return true;
@@ -1372,7 +1491,7 @@
     React.useEffect(function () {
       return function () {
         tabsRef.current.forEach(function (tab) {
-          closeWsFor(tab);
+          closeTransportFor(tab);
         });
         tabsRef.current.forEach(function (tab) {
           if (tab.term) { try { tab.term.dispose(); } catch (e) { /* ignore */ } }

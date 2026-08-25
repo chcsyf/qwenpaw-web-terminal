@@ -1,5 +1,19 @@
 # 变更记录 (Changelog)
 
+## v0.2.3 - 2026-08-25
+
+- **SSE 降级传输通道（方案 A）**：平台网关丢失 WebSocket `Upgrade`/`Connection` 头导致
+  WS 握手被当普通 GET 返回 404 时，前端 WS 首次握手失败自动降级为 SSE，控制台仍可交互——
+  - 后端新增 `GET /api/qwenpaw-web-terminal/stream?session=x`（SSE 输出流，`data:` 行为
+    base64(UTF-8)，`:` 注释行 ping 保活，基于会话缓冲偏移量轮询，零侵入 PTY 循环）
+  - 后端新增 `POST /api/qwenpaw-web-terminal/input`（SSE 模式统一输入通道 `{session_id, data}`，
+    data 兼容 WS 控制协议 `\x00resize:c:r` / `\x00ping`）
+  - 前端新增 `openSseFor` / `closeTransportFor` / `sendInput` 统一入口，WS 与 SSE 共用
+- **修复 AI 命令卡片在 SSE 降级下失效**：`ptySend`（「插入脚本/运行/清空/中断」四按钮回调）
+  原只写 WS 通道，SSE 降级时命令被丢弃无回显；现复用 `sendInput` 的 SSE/WS 分派，SSE 已建立时
+  走 `POST /input` 命中下一轮数据流
+- **版本号统一为 0.2.3**（plugin.py / plugin.json / index.js / README）
+
 ## v0.2.2 - 2026-08-15
 
 - **AI 面板模型下拉只显示可用大模型**：`GET /ai/models` 过滤未配置 API key 的 provider
