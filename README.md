@@ -1,4 +1,4 @@
-# 🖥️ Web 终端 (qwenpaw-web-terminal) v0.2.5
+# 🖥️ Web 终端 (qwenpaw-web-terminal) v0.2.6
 
 浏览器终端窗口插件：多标签（每标签独立 PTY，关闭标签即结束终端）+ 会话持久化（刷新/断网后台保留，可重新 attach 并回放输出）+ 会话管理面板（查看/打开/结束/清理，同名新建自动打开）+ xterm.js 渲染（ANSI/光标/Tab 补全/复制粘贴）+ 单条命令执行（exec）+ WebSocket 交互式 PTY + 多会话 + 自动重连 + 惰性连接 + **AI 助手面板**（自动读取当前终端内容与目录，生成命令可一键写入终端（不执行）或执行）。采用 [Apache License 2.0](LICENSE) 许可协议发布。
 

@@ -82,7 +82,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.2.5"
+PLUGIN_VERSION = "0.2.6"
 
 router = APIRouter()
 
@@ -295,7 +295,11 @@ async def exec_cmd(req: ExecRequest, request: Request):
         return {"ok": True, "stdout": "", "stderr": "", "exit_code": 0, "cwd": new_cwd}
 
     try:
-        proc = subprocess.run(
+        # 关键：subprocess.run 是同步阻塞调用，最长可阻塞到 timeout（≤300s）。
+        # 直接在事件循环线程执行会冻结整个 QwenPaw 服务（所有 agent / 通道 / HTTP
+        # 一起停摆），必须丢到线程池执行（asyncio.to_thread）。
+        proc = await asyncio.to_thread(
+            subprocess.run,
             cmd,
             shell=True,
             cwd=cwd,

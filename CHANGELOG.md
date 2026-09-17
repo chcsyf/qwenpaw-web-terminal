@@ -1,5 +1,15 @@
 # 变更记录 (Changelog)
 
+## v0.2.6 - 2026-09-17
+
+- **修复：`/exec` 端点阻塞事件循环（与 v0.2.5 同源，但入口不同）**
+  - 根因：`exec_cmd()` 是 `async def`，却直接在事件循环线程执行
+    `subprocess.run(cmd, shell=True, timeout=min(max(req.timeout,1),300))`，
+    单条命令最长可冻结整个 QwenPaw 服务 **300 秒**（所有 agent / 通道 / HTTP 一起停摆）。
+  - 修复：改为 `await asyncio.to_thread(subprocess.run, ...)`，阻塞转移到线程池。
+  - 备注：v0.2.5 修的是 PTY I/O 路径（`_pty_loop` 的 `os.read` / `_pty_write` 的 `os.write`），
+    本次是该插件第二处同源阻塞入口。
+
 ## v0.2.5 - 2026-09-17
 
 - **修复「PTY I/O 阻塞 asyncio 事件循环」（破坏性 bug）**：
