@@ -1,5 +1,5 @@
 """
-Web 终端插件 v0.2.4 - QwenPaw
+Web 终端插件 v0.2.5 - QwenPaw
 浏览器终端窗口：
   - GET    /api/qwenpaw-web-terminal/status            插件状态、版本、cwd（支持 ?session_id=）
   - GET    /api/qwenpaw-web-terminal/sessions          会话列表（含 PTY 运行状态，供管理面板）
@@ -14,6 +14,20 @@ Web 终端插件 v0.2.4 - QwenPaw
                                                        （data 兼容 WS 控制协议：\x00resize:c:r / \x00ping）
   - POST   /api/qwenpaw-web-terminal/ai/chat           AI 助手对话（SSE 流式，自动附带当前终端内容）
   - GET    /api/qwenpaw-web-terminal/ai/models         可用模型列表（AI 面板下拉选择）
+
+v0.2.5 修复（PTY I/O 阻塞 asyncio 事件循环 —— 破坏性）：
+  - 根因：pty.openpty() 返回的 master_fd 默认【阻塞】，而 os.read/os.write 直接在
+    事件循环线程执行；一旦「无数据 / PTY 输入缓冲满」就真阻塞，整个事件循环停摆
+    （实测主服务所有 HTTP 悬挂 30s 被浏览器取消、SSE 永久 pending，约 40s 无响应）。
+  - 修复（完整版方案 A）：
+    * _spawn_pty() 把 master_fd 置为非阻塞 os.set_blocking(fd, False)
+    * 读循环单独捕获 BlockingIOError(EAGAIN) → continue（旧代码的 except OSError 会把
+      它当致命错误 break，反而直接打死读循环）
+    * 写路径（WS 输入 / SSE /input）改 _pty_write()：非阻塞 + 让出事件循环重试，
+      EAGAIN 时不丢键、不阻塞事件循环
+  - 加固：事件循环延迟自检 _lag_watchdog()（lag > 200ms 打 WARNING，回归哨兵）；
+    清理路径 proc.wait 超时 1s → 0.2s，降低最坏阻塞。
+  - 版本号统一为 0.2.5（plugin.py / plugin.json / index.js / README）
 
 v0.2.4 新增（性能 + 认证 + 传输健壮性）：
   - 修复 PTY 读循环用同步 select.select() 阻塞 asyncio 事件循环（实测主服务 ~101ms 延迟尖峰）
@@ -68,7 +82,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.2.4"
+PLUGIN_VERSION = "0.2.5"
 
 router = APIRouter()
 
@@ -103,6 +117,14 @@ _exec_timeout = 60.0
 _HEARTBEAT_TIMEOUT = 60.0
 _REAPER_INTERVAL = 20.0
 _reaper_task: "asyncio.Task | None" = None
+# 事件循环延迟自检（回归哨兵）：任何在事件循环线程上的阻塞调用（PTY I/O、DNS、
+# 磁盘…）都会表现为 loop lag。超阈值打 WARNING，便于一装上就发现，而不是等页面卡死。
+_lag_task: "asyncio.Task | None" = None
+_LAG_WARN_SEC = 0.2
+# 延迟自检的观测状态（经 /status 暴露）。
+# 注意：插件自身的 logger 未接入主日志文件，仅靠 logger.warning 用户在日志里看不到，
+# 必须提供可直接查询的出口，否则「回归哨兵」形同虚设。
+_lag_state: dict = {"last_ms": 0.0, "max_ms": 0.0, "warns": 0, "samples": 0}
 # SSE 降级通道：输出轮询间隔 / 网关保活注释帧间隔
 _SSE_POLL = 0.08
 _SSE_KEEPALIVE = 15.0
@@ -162,6 +184,14 @@ async def get_status(session_id: str = "default"):
         "type": "pty",
         "cwd": _session_cwd(session_id),
         "supports": ["exec", "pty_websocket", "sessions", "persistent_pty"],
+        # 事件循环延迟自检（回归哨兵）：
+        #   loop_lag_ms     — 最近一次采样（正常应 < 20ms）
+        #   loop_lag_max_ms — 进程内历史最大（若飙升到数百 ms/秒级，说明事件循环被阻塞）
+        #   loop_lag_warns  — 超过 200ms 阈值的次数（应恒为 0）
+        "loop_lag_ms": round(_lag_state["last_ms"], 1),
+        "loop_lag_max_ms": round(_lag_state["max_ms"], 1),
+        "loop_lag_warns": _lag_state["warns"],
+        "loop_lag_samples": _lag_state["samples"],
     }
 
 
@@ -545,6 +575,30 @@ def _append_buf(entry, data: bytes) -> None:
     _notify_sse(entry)
 
 
+async def _pty_write(entry, data: bytes) -> bool:
+    """把前端输入写入 PTY（master_fd 已置非阻塞）。
+
+    - 非阻塞写 + 让出事件循环重试：PTY 输入缓冲满时 os.write 抛 EAGAIN，
+      绝不能阻塞事件循环；也不能丢弃（丢键），所以 sleep 后重试直到写完。
+    - 返回 False 表示 fd 已失效（会话结束 / 被清理）。
+    """
+    view = memoryview(data)
+    while len(view):
+        fd = entry.get("master_fd")
+        if fd is None:
+            return False
+        try:
+            n = os.write(fd, view)
+        except BlockingIOError:
+            # EAGAIN：内核 PTY 输入缓冲已满，稍后重试（不丢输入、不阻塞事件循环）
+            await asyncio.sleep(0.005)
+            continue
+        except (OSError, ValueError):
+            return False
+        view = view[n:]
+    return True
+
+
 def _spawn_pty(session_id: str, cwd: str):
     """创建交互式 bash PTY 子进程并登记到 _pty_store，返回记录。
 
@@ -567,6 +621,16 @@ def _spawn_pty(session_id: str, cwd: str):
         close_fds=True,
     )
     os.close(slave_fd)
+    # 关键：master_fd 默认是【阻塞】模式。若不置为非阻塞，事件循环线程上的
+    # os.read/os.write 一旦遇到「无数据 / PTY 输入缓冲满」就会真阻塞，
+    # 导致整个 asyncio 事件循环停摆（实测主服务无响应约 40 秒，HTTP/SSE 全部悬挂）。
+    try:
+        os.set_blocking(master_fd, False)
+    except (OSError, AttributeError):  # noqa: BLE001
+        logger.warning(
+            "[qwenpaw-web-terminal] os.set_blocking(master_fd, False) 失败，"
+            "PTY I/O 仍可能在事件循环线程上阻塞"
+        )
     # 默认窗口 80x24
     try:
         fcntl.ioctl(
@@ -599,6 +663,7 @@ def _spawn_pty(session_id: str, cwd: str):
 
 def _attach_or_spawn(session_id: str):
     """返回该会话的 PTY 记录：进程存活则复用（attach），否则重新 spawn。"""
+    _ensure_bg_tasks()  # 热重载后 startup hook 不保证执行，这里惰性补启后台任务
     entry = _pty_store.get(session_id)
     if entry and entry.get("proc") is not None and entry["proc"].poll() is None:
         return entry
@@ -640,14 +705,61 @@ def _cleanup_pty(session_id: str, entry) -> None:
     except OSError:
         pass
     proc = entry.get("proc")
-    if proc is not None:
+    if proc is not None and proc.poll() is None:
+        # 刚被 kill：通常毫秒级退出。用很短超时，避免在事件循环线程上长时间阻塞
+        # （旧值 1s 意味着最坏情况事件循环被占住 1 秒）。
         try:
-            proc.wait(timeout=1)
+            proc.wait(timeout=0.2)
         except Exception:  # noqa: BLE001
             try:
                 proc.kill()
             except Exception:  # noqa: BLE001
                 pass
+
+
+async def _lag_watchdog() -> None:
+    """事件循环延迟自检：每 0.5s 采样一次 loop lag，超过阈值打 WARNING。
+
+    这是「PTY 阻塞事件循环」这类问题的回归哨兵——只要事件循环被任何同步调用
+    （os.read/os.write、DNS、磁盘 I/O…）占住，lag 立刻飙升并在日志里可见，
+    不必等到页面卡死才发现。lag 长期为 0 即说明事件循环健康。
+    """
+    loop = asyncio.get_running_loop()
+    while True:
+        t0 = loop.time()
+        await asyncio.sleep(0.5)
+        lag = loop.time() - t0 - 0.5
+        lag_ms = lag * 1000.0
+        _lag_state["last_ms"] = lag_ms
+        _lag_state["samples"] += 1
+        if lag_ms > _lag_state["max_ms"]:
+            _lag_state["max_ms"] = lag_ms
+        if lag > _LAG_WARN_SEC:
+            _lag_state["warns"] += 1
+            logger.warning(
+                "[qwenpaw-web-terminal] event loop lag %.0fms (> %.0fms 阈值) —— "
+                "有阻塞调用占住了事件循环线程",
+                lag_ms,
+                _LAG_WARN_SEC * 1000,
+            )
+
+
+def _ensure_bg_tasks() -> None:
+    """确保后台任务（心跳清理 / 延迟自检）在运行（幂等）。
+
+    正常路径由 startup hook 启动；但热重载（POST /api/plugins/install）时
+    startup hook 不一定重新执行，故在首个会话请求路径上惰性补启，
+    保证哨兵始终在线。
+    """
+    global _reaper_task, _lag_task
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return
+    if _reaper_task is None or _reaper_task.done():
+        _reaper_task = loop.create_task(_reaper_loop())
+    if _lag_task is None or _lag_task.done():
+        _lag_task = loop.create_task(_lag_watchdog())
 
 
 async def _reaper_loop() -> None:
@@ -723,6 +835,12 @@ async def _pty_loop(session_id: str, entry) -> None:
                     continue
             try:
                 data = os.read(master_fd, 4096)
+            except BlockingIOError:
+                # master_fd 已置非阻塞：本次唤醒其实无数据可读（add_reader 是电平触发，
+                # 可能为已被取走的数据置位）。EAGAIN 不是错误、更不是 EOF ——
+                # 必须 continue 回去等待；绝不能 break（会误杀读循环，且旧代码的
+                # `except OSError` 会把 BlockingIOError 当致命错误吞掉）。
+                continue
             except OSError:
                 break
             if not data:
@@ -831,9 +949,7 @@ async def pty_ws(ws: WebSocket):
                 continue
             entry["last_activity"] = time.time()
             entry["last_seen"] = time.time()
-            try:
-                os.write(entry["master_fd"], text.encode("utf-8"))
-            except OSError:
+            if not await _pty_write(entry, text.encode("utf-8")):
                 break
     except WebSocketDisconnect:
         pass
@@ -958,10 +1074,8 @@ async def pty_input(req: InputRequest):
         return {"ok": True, "pong": True}
     entry["last_activity"] = time.time()
     entry["last_seen"] = time.time()
-    try:
-        os.write(entry["master_fd"], text.encode("utf-8"))
-    except OSError as e:
-        return {"ok": False, "error": str(e)}
+    if not await _pty_write(entry, text.encode("utf-8")):
+        return {"ok": False, "error": "pty write failed (session closed)"}
     return {"ok": True}
 
 
@@ -991,9 +1105,11 @@ class WebTerminalPlugin:
             api.register_shutdown_hook("qwenpaw_web_terminal_shutdown", self._shutdown)
 
     async def _startup(self) -> None:
-        global _reaper_task
+        global _reaper_task, _lag_task
         if _reaper_task is None or _reaper_task.done():
             _reaper_task = asyncio.create_task(_reaper_loop())
+        if _lag_task is None or _lag_task.done():
+            _lag_task = asyncio.create_task(_lag_watchdog())
         logger.info(
             "[qwenpaw-web-terminal] Plugin v%s started - cwd=%s, sessions=%s",
             PLUGIN_VERSION,
@@ -1003,10 +1119,13 @@ class WebTerminalPlugin:
 
     async def _shutdown(self) -> None:
         """主服务退出时清理所有遗留 PTY 进程，避免孤儿 bash。"""
-        global _reaper_task
+        global _reaper_task, _lag_task
         if _reaper_task is not None:
             _reaper_task.cancel()
             _reaper_task = None
+        if _lag_task is not None:
+            _lag_task.cancel()
+            _lag_task = None
         killed = 0
         for sid in list(_pty_store.keys()):
             if _kill_pty(sid):

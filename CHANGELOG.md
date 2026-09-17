@@ -1,5 +1,25 @@
 # 变更记录 (Changelog)
 
+## v0.2.5 - 2026-09-17
+
+- **修复「PTY I/O 阻塞 asyncio 事件循环」（破坏性 bug）**：
+  - **现象**：主服务整体无响应——所有 HTTP 请求挂起 30s 被浏览器取消、SSE 永久 pending、
+    `Failed to load agents`，实测连续约 **40s**；卸载插件后消失（栈顶 `plugin.py:_pty_loop` 的
+    `os.read`，syscall 证据 `read` on `/dev/pts/ptmx`，其余线程 futex 等锁）。
+  - **根因（两层叠加）**：
+    1. `pty.openpty()` 返回的 `master_fd` 是**阻塞模式**（全文无 `os.set_blocking`/`O_NONBLOCK`）；
+    2. `os.read`（读循环）与 `os.write`（WS / SSE 输入通道，两处）**直接在事件循环线程执行**。
+       一旦「无数据 / PTY 输入缓冲满」，内核调用真阻塞 → 整个事件循环停摆。
+  - **修复**：
+    * `_spawn_pty()`：`os.set_blocking(master_fd, False)` —— 从根上让 PTY I/O 不再阻塞。
+    * 读循环单独捕获 `BlockingIOError`(EAGAIN) → `continue`。
+      ⚠️ 必须放在 `except OSError` **之前**：`BlockingIOError` 是 `OSError` 子类，
+      旧代码的 `except OSError: break` 会在置非阻塞后把 EAGAIN 当致命错误，**直接把读循环打死**。
+    * 写路径改用 `_pty_write()`：非阻塞 + 让出事件循环重试（EAGAIN 时不丢键、不阻塞事件循环）。
+  - **加固**：新增事件循环延迟自检 `_lag_watchdog()`（lag > 200ms 打 WARNING，作为回归哨兵）；
+    `_cleanup_pty()` 的 `proc.wait` 超时 1s → 0.2s，降低最坏情况阻塞。
+- **版本号统一为 0.2.5**（plugin.py / plugin.json / index.js / README）
+
 ## v0.2.4 - 2026-09-11
 
 - **修复「开启登录认证后公网访问不可用（两处 401）」**：

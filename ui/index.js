@@ -15,7 +15,7 @@
   // vendor 静态资源必须走【免登录公开路径】：<script>/<link> 无法携带 Authorization 头，
   // 走 /api/plugins/... 在开启登录认证的部署下会被 401 拦掉 → 终端渲染库(xterm)加载失败 → 空白。
   var FILES_BASE = "/api/frontend_plugin/" + PLUGIN_ID + "/files/ui/vendor";
-  var VERSION = "0.2.4";
+  var VERSION = "0.2.5";
   // ============ 认证 token（开启登录认证的部署必需） ============
   // 与 console 前端一致：token 存于 localStorage['qwenpaw_auth_token']
   var AUTH_TOKEN_KEY = "qwenpaw_auth_token";
