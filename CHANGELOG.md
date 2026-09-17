@@ -1,5 +1,27 @@
 # 变更记录 (Changelog)
 
+## v0.2.4 - 2026-09-11
+
+- **修复「开启登录认证后公网访问不可用（两处 401）」**：
+  - 所有 API 请求统一经 `apiFetch()` 注入 `Authorization: Bearer <localStorage['qwenpaw_auth_token']>`
+    （原仅部分请求带 `X-Agent-Id`，认证开启后 `GET /sessions`、`DELETE`、`/status`、`/ai/models`、
+    `/api/approval/*` 等均 401）
+  - WS / SSE(`EventSource`) 无法自定义请求头 → 连接 URL 追加 `&token=`（AuthMiddleware 支持 query token）
+  - vendor 静态资源（xterm.js 等）改走**免登录公开路径** `/api/frontend_plugin/{id}/files/ui/vendor/`，
+    不再走 `/api/plugins/{id}/files/`：后者需认证且 `<script>` 无法带 Header → 公网下 401，
+    `window.Terminal` 加载失败导致「显示已连接但终端区域空白」
+- **性能修复（影响整个主服务，不止本插件）**：
+  - PTY 读循环原用同步 `select.select(..., 0.1)`，空转时每会话每轮阻塞 asyncio 事件循环最多
+    100ms（实测主服务响应出现 ~101ms 延迟尖峰）→ 改 `loop.add_reader()` 事件驱动
+  - 历史缓冲原 `(buf + data)[-_BUF_MAX:]` 在缓冲接近 4MB 时每次追加都整块复制（O(n²)），
+    高频输出下 CPU 飙升 → 改 `bytearray` 原地追加 + 超限按需裁剪
+  - SSE 下行原 80ms 轮询会话缓冲 → 改事件驱动（新输出即时推送，keepalive 注释帧保活）
+- **传输健壮性**：
+  - SSE 上行输入合并 + 串行发送（逐键 POST → ~15ms 批量、同一时刻仅一个请求在飞，保证 FIFO 顺序）
+  - WS 首次握手失败先重试 3 次再降级 SSE（避免瞬时抖动/服务重启导致永久降级）
+  - SSE 连接异常时给出明确提示（原为静默）
+- **版本号统一为 0.2.4**（plugin.py / plugin.json / index.js / README）
+
 ## v0.2.3 - 2026-08-25
 
 - **SSE 降级传输通道（方案 A）**：平台网关丢失 WebSocket `Upgrade`/`Connection` 头导致

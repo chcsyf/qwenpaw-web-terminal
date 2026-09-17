@@ -12,8 +12,45 @@
 
   var PLUGIN_ID = "qwenpaw-web-terminal";
   var API_BASE = "/api/qwenpaw-web-terminal";
-  var FILES_BASE = "/api/plugins/" + PLUGIN_ID + "/files/ui/vendor";
-  var VERSION = "0.2.3";
+  // vendor 静态资源必须走【免登录公开路径】：<script>/<link> 无法携带 Authorization 头，
+  // 走 /api/plugins/... 在开启登录认证的部署下会被 401 拦掉 → 终端渲染库(xterm)加载失败 → 空白。
+  var FILES_BASE = "/api/frontend_plugin/" + PLUGIN_ID + "/files/ui/vendor";
+  var VERSION = "0.2.4";
+  // ============ 认证 token（开启登录认证的部署必需） ============
+  // 与 console 前端一致：token 存于 localStorage['qwenpaw_auth_token']
+  var AUTH_TOKEN_KEY = "qwenpaw_auth_token";
+  function getAuthToken() {
+    try { return localStorage.getItem(AUTH_TOKEN_KEY) || ""; } catch (e) { return ""; }
+  }
+  // WS / SSE(EventSource) 无法自定义请求头 → 只能把 token 追加到 URL 查询参数
+  function withToken(url) {
+    var tok = getAuthToken();
+    if (!tok) return url;
+    return url + (url.indexOf("?") >= 0 ? "&" : "?") + "token=" + encodeURIComponent(tok);
+  }
+  // 统一认证头（Authorization Bearer + X-Agent-Id），供所有 fetch 使用
+  function authHeaders() {
+    var h = {};
+    var tok = getAuthToken();
+    if (tok) h["Authorization"] = "Bearer " + tok;
+    try {
+      var i = sessionStorage.getItem("qwenpaw-agent-storage") || localStorage.getItem("qwenpaw-agent-storage");
+      if (i) {
+        var n = JSON.parse(i);
+        var o = n && n.state && n.state.selectedAgent;
+        if (o) h["X-Agent-Id"] = o;
+      }
+    } catch (e) { /* ignore */ }
+    return h;
+  }
+  // 原始 fetch 引用（命名与 apiFetch 区分，避免全局替换时自递归）
+  var _rawFetch = window.fetch.bind(window);
+  // 统一 API 请求入口：自动注入认证头，杜绝漏带凭证的 401
+  function apiFetch(url, opts) {
+    opts = opts || {};
+    opts.headers = Object.assign({}, authHeaders(), opts.headers || {});
+    return _rawFetch(url, opts);
+  }
 
   // ============ 样式（GitHub Dark） ============
   var S = {
@@ -398,18 +435,8 @@
   }
 
   // 读取 console 当前选中的智能体 id（与主前端一致：qwenpaw-agent-storage.state.selectedAgent）
-  function agentHeaders() {
-    var h = {};
-    try {
-      var i = sessionStorage.getItem('qwenpaw-agent-storage') || localStorage.getItem('qwenpaw-agent-storage');
-      if (i) {
-        var n = JSON.parse(i);
-        var o = n && n.state && n.state.selectedAgent;
-        if (o) h['X-Agent-Id'] = o;
-      }
-    } catch (e) { /* ignore */ }
-    return h;
-  }
+  // 委托到顶层 authHeaders()（保持既有调用点不变）
+  function agentHeaders() { return authHeaders(); }
 
   // 标签布局持久化（localStorage）：刷新页面后恢复上次打开的标签；
   // 后端会话全量放「会话管理」面板查看，标签栏只保留用户主动打开过的会话
@@ -551,7 +578,7 @@
       tab.started = true; // 已执行过 exec → 模式锁定
       writeTo(tab, '\r\n\x1b[92m$ ' + cmd + '\x1b[0m\r\n');
       tab.buf = '';
-      fetch(API_BASE + '/exec', {
+      apiFetch(API_BASE + '/exec', {
         method: 'POST',
         headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
         body: JSON.stringify({ cmd: cmd, session_id: tab.id })
@@ -610,10 +637,16 @@
     }
 
     // ---- 传输通道（每个标签独立）：优先 WS，网关不支持时降级 SSE ----
+    var WS_FALLBACK_RETRY = 3;   // WS 握手连续失败多少次后才降级 SSE（防瞬时抖动误降级）
     function closeTransportFor(tab) {
       stopReconnect(tab);
       tab.reconnectCount = 0;
       tab.pendingInput = '';
+      if (tab.sseFlushTimer) {
+        clearTimeout(tab.sseFlushTimer);
+        tab.sseFlushTimer = null;
+      }
+      tab.sseOut = '';
       if (tab.ws) {
         try { tab.ws.close(); } catch (e) { /* ignore */ }
         tab.ws = null;
@@ -645,7 +678,7 @@
         tab.ws = null;
       }
       var proto = location.protocol === 'https:' ? 'wss://' : 'ws://';
-      var url = proto + location.host + API_BASE + '/ws?session=' + encodeURIComponent(tab.id);
+      var url = withToken(proto + location.host + API_BASE + '/ws?session=' + encodeURIComponent(tab.id));
       setTabWsState(tab.id, 'connecting');
       var ws = new WebSocket(url);
       tab.ws = ws;
@@ -655,6 +688,7 @@
         tab.transport = 'ws';
         setTransportPref('ws');    // 本地/正常环境：WS 可用，写回偏好
         tab.reconnectCount = 0;
+        tab.wsFailCount = 0;       // 握手成功：清零降级计数
         tab.started = true; // PTY 已连接 → 模式锁定
         setTabWsState(tab.id, 'open');
         showToast('已连接交互式终端（' + tab.id + '）');
@@ -689,9 +723,16 @@
         stopReconnect(tab);
         setTabWsState(tab.id, 'closed');
         // 平台网关可能不透传 WebSocket Upgrade 头 → 后端把握手当普通 GET 返回 404。
-        // 浏览器无法读取该 HTTP 状态码，故以「从未成功 open」判定首次握手失败：
-        // 若偏好允许且尚未尝试 SSE，则降级到 SSE（并记忆偏好），不再原地死循环重连。
+        // 浏览器无法读取该 HTTP 状态码，故以「从未成功 open」判定握手失败。
+        // 但瞬时抖动/服务重启也会「从未 open」→ 先重试 WS 若干次，仍失败才降级 SSE
+        //（并记忆偏好），避免一次瞬时故障就把用户永久锁进 SSE。
         if (!ws._everOpened && tab.mode === 'pty' && tab.transport !== 'sse') {
+          tab.wsFailCount = (tab.wsFailCount || 0) + 1;
+          if (tab.wsFailCount <= WS_FALLBACK_RETRY) {
+            showToast('WebSocket 连接失败，重试中（' + tab.wsFailCount + '/' + WS_FALLBACK_RETRY + '）...');
+            tab.reconnectTimer = setTimeout(function () { openWsFor(tab); }, 800);
+            return;
+          }
           tab.transport = 'sse';
           tab.sseTried = true;
           setTransportPref('sse');
@@ -715,12 +756,12 @@
       };
     }
 
-    // ---- SSE 降级通道：下行 EventSource + 上行 fetch(POST /input) ----
+    // ---- SSE 降级通道：下行 EventSource + 上行 apiFetch(POST /input) ----
     function openSseFor(tab) {
       stopReconnect(tab);
       if (tab.ws) { try { tab.ws.close(); } catch (e) { /* ignore */ } tab.ws = null; }
       tab.reconnectCount = 0;
-      var url = API_BASE + '/stream?session=' + encodeURIComponent(tab.id);
+      var url = withToken(API_BASE + '/stream?session=' + encodeURIComponent(tab.id));
       setTabWsState(tab.id, 'connecting');
       var es = new EventSource(url);
       tab.sse = es;
@@ -755,26 +796,54 @@
         } catch (e) { /* 忽略坏帧 */ }
       };
       es.onerror = function () {
-        // EventSource 内置自动重连；此处仅同步 UI 状态
+        // EventSource 内置自动重连；此处同步 UI 状态，并在首次失败时给出明确提示
         if (tab.sse !== es) return;
         setTabWsState(tab.id, tab.started ? 'open' : 'connecting');
+        if (!tab.started && !tab.sseErrShown) {
+          tab.sseErrShown = true;
+          showToast('SSE 连接异常，正在自动重试...');
+        }
       };
     }
 
     // ---- 统一入口：按当前传输通道发送文本（WS 帧 / SSE POST /input 复用同协议） ----
+    // SSE 上行做「合并 + 串行」：短时间内的多次输入（逐键）合并为一个 POST，且同一时刻
+    // 只有一个请求在飞（保证 FIFO 顺序），避免快速输入/大段粘贴时的请求风暴与乱序。
+    var SSE_INPUT_FLUSH_MS = 15;
     function sendInput(tab, data) {
       if (tab.transport === 'sse' || (tab.transport === 'auto' && tab.sse && !tab.ws)) {
-        fetch(API_BASE + '/input', {
-          method: 'POST',
-          headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
-          body: JSON.stringify({ session_id: tab.id, data: data })
-        }).catch(function () { /* 忽略 */ });
+        queueSseInput(tab, data);
         return;
       }
       // WS 模式（或未知偏好下已建立的 WS）
       if (tab.ws && tab.ws.readyState === WebSocket.OPEN) {
         try { tab.ws.send(data); } catch (e) { /* ignore */ }
       }
+    }
+
+    function queueSseInput(tab, data) {
+      tab.sseOut = (tab.sseOut || '') + data;
+      if (tab.sseFlushTimer || tab.sseSending) return;  // 已有定时器/请求在飞：由它们续发
+      tab.sseFlushTimer = setTimeout(function () {
+        tab.sseFlushTimer = null;
+        pumpSseInput(tab);
+      }, SSE_INPUT_FLUSH_MS);
+    }
+
+    function pumpSseInput(tab) {
+      if (tab.sseSending) return;                      // 串行：等当前请求完成后再续发
+      var payload = tab.sseOut || '';
+      if (!payload) return;
+      tab.sseOut = '';
+      tab.sseSending = true;
+      apiFetch(API_BASE + '/input', {
+        method: 'POST',
+        headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
+        body: JSON.stringify({ session_id: tab.id, data: payload })
+      }).catch(function () { /* 忽略 */ }).then(function () {
+        tab.sseSending = false;
+        if (tab.sseOut) pumpSseInput(tab);             // 期间又有输入 → 继续串行发送
+      });
     }
 
     function ensureConnected(tab) {
@@ -932,7 +1001,7 @@
 
     // 打开或创建会话：同名已存在 → 直接打开（不重置、不重复创建）；否则创建
     function openOrCreateSession(name, fromMgr) {
-      fetch(API_BASE + '/sessions')
+      apiFetch(API_BASE + '/sessions')
         .then(function (r) { return r.json(); })
         .then(function (d) {
           var list = (d && d.ok && d.sessions) ? d.sessions : [];
@@ -949,7 +1018,7 @@
             if (fromMgr) refreshMgr();
             return;
           }
-          fetch(API_BASE + '/sessions', {
+          apiFetch(API_BASE + '/sessions', {
             method: 'POST',
             headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
             body: JSON.stringify({ id: name })
@@ -992,7 +1061,7 @@
       tabsRef.current.delete(id);
       delete mountsRef.current[id];
       // 清理后端会话状态（兜底杀活跃 PTY）
-      fetch(API_BASE + '/sessions/' + encodeURIComponent(id), { method: 'DELETE' }).catch(function () {});
+      apiFetch(API_BASE + '/sessions/' + encodeURIComponent(id), { method: 'DELETE' }).catch(function () {});
       var idx = tabOrderRef.current.indexOf(id);
       var order = tabOrderRef.current.filter(function (x) { return x !== id; });
       tabOrderRef.current = order;
@@ -1043,7 +1112,7 @@
     React.useEffect(function () {
       var saved = null;
       try { saved = localStorage.getItem(LS_AI_MODEL); } catch (e) { saved = null; }
-      fetch(API_BASE + '/ai/models')
+      apiFetch(API_BASE + '/ai/models')
         .then(function (r) { return r.json(); })
         .then(function (data) {
           var list = (data && data.models) || [];
@@ -1066,7 +1135,7 @@
       setAiBusy(true);
       var ctrl = new AbortController();
       aiAbortRef.current = ctrl;
-      fetch(API_BASE + '/ai/chat', {
+      apiFetch(API_BASE + '/ai/chat', {
         method: 'POST',
         headers: Object.assign({ 'Content-Type': 'application/json' }, agentHeaders()),
         body: JSON.stringify({
@@ -1192,7 +1261,7 @@
       if (!aiBusy) { setAiApprovals([]); return; }
       var sid = aiSessionId();
       var timer = setInterval(function () {
-        fetch('/api/approval/list')
+        apiFetch('/api/approval/list')
           .then(function (r) { return r.json(); })
           .then(function (data) {
             if (!data || !Array.isArray(data.pending_approvals)) return;
@@ -1208,7 +1277,7 @@
 
     function resolveApproval(req, approve) {
       var body = { request_id: req.request_id, session_id: aiSessionId() };
-      fetch('/api/approval/' + (approve ? 'approve' : 'deny'), {
+      apiFetch('/api/approval/' + (approve ? 'approve' : 'deny'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body)
@@ -1354,7 +1423,7 @@
     }
     function refreshMgr() {
       setMgrLoading(true);
-      fetch(API_BASE + '/sessions')
+      apiFetch(API_BASE + '/sessions')
         .then(function (r) { return r.json(); })
         .then(function (d) {
           setMgrData((d && d.ok) ? d : { sessions: [], error: (d && d.error) || '加载失败' });
@@ -1374,12 +1443,12 @@
       showToast('已打开会话：' + id + '（后台进程将自动 attach）');
     }
     function mgrKillSession(id) {
-      fetch(API_BASE + '/sessions/' + encodeURIComponent(id) + '/kill', { method: 'POST' })
+      apiFetch(API_BASE + '/sessions/' + encodeURIComponent(id) + '/kill', { method: 'POST' })
         .then(function (r) { return r.json(); })
         .then(function (d) { refreshMgr(); showToast('已结束进程：' + id + (d && d.killed ? '' : '（无运行进程）')); });
     }
     function mgrDeleteSession(id) {
-      fetch(API_BASE + '/sessions/' + encodeURIComponent(id), { method: 'DELETE' })
+      apiFetch(API_BASE + '/sessions/' + encodeURIComponent(id), { method: 'DELETE' })
         .then(function (r) { return r.json(); })
         .then(function () {
           // 若该会话是打开的标签，一并关掉
@@ -1399,7 +1468,7 @@
       var p = Promise.resolve();
       ids.forEach(function (id) {
         p = p.then(function () {
-          return fetch(API_BASE + '/sessions/' + encodeURIComponent(id), { method: 'DELETE' });
+          return apiFetch(API_BASE + '/sessions/' + encodeURIComponent(id), { method: 'DELETE' });
         });
       });
       p.then(function () { refreshMgr(); showToast('已结束并删除 ' + ids.length + ' 个后台会话'); });
@@ -1425,13 +1494,13 @@
 
     // ---- 初始化：数据 + 恢复已有会话为标签 ----
     React.useEffect(function () {
-      fetch(API_BASE + '/status')
+      apiFetch(API_BASE + '/status')
         .then(function (r) { return r.json(); })
         .then(function (d) {
           if (d && d.ok) setVersion(d.version || VERSION);
         })
         .catch(function () {});
-      fetch(API_BASE + '/sessions')
+      apiFetch(API_BASE + '/sessions')
         .then(function (r) { return r.json(); })
         .then(function (d) {
           var list = (d && d.ok && d.sessions) ? d.sessions : [];

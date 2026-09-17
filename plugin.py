@@ -1,5 +1,5 @@
 """
-Web 终端插件 v0.2.3 - QwenPaw
+Web 终端插件 v0.2.4 - QwenPaw
 浏览器终端窗口：
   - GET    /api/qwenpaw-web-terminal/status            插件状态、版本、cwd（支持 ?session_id=）
   - GET    /api/qwenpaw-web-terminal/sessions          会话列表（含 PTY 运行状态，供管理面板）
@@ -14,6 +14,21 @@ Web 终端插件 v0.2.3 - QwenPaw
                                                        （data 兼容 WS 控制协议：\x00resize:c:r / \x00ping）
   - POST   /api/qwenpaw-web-terminal/ai/chat           AI 助手对话（SSE 流式，自动附带当前终端内容）
   - GET    /api/qwenpaw-web-terminal/ai/models         可用模型列表（AI 面板下拉选择）
+
+v0.2.4 新增（性能 + 认证 + 传输健壮性）：
+  - 修复 PTY 读循环用同步 select.select() 阻塞 asyncio 事件循环（实测主服务 ~101ms 延迟尖峰）
+    → 改 loop.add_reader() 事件驱动（不支持时回退非阻塞轮询）
+  - 修复历史缓冲 O(n²) 复制（(buf+data)[-4MB:] 每次整块复制）→ bytearray 原地追加 + 按需裁剪
+  - SSE 下行改事件驱动（原为 80ms 轮询 buf）→ 新输出即时推送、keepalive 注释帧保活
+  - 修复「开启登录认证后公网访问不可用（两处 401）」：
+    * 所有 fetch 统一经 apiFetch() 注入 Authorization: Bearer <localStorage['qwenpaw_auth_token']>
+    * WS / SSE(EventSource) 无法带请求头 → URL 追加 &token=（AuthMiddleware 支持 query token）
+    * vendor 静态资源(xterm) 改走免登录公开路径 /api/frontend_plugin/{id}/files/...
+      （原 /api/plugins/.../files/ 需认证，<script> 带不了头 → 终端渲染库加载失败、区域空白）
+  - SSE 上行输入合并 + 串行发送（逐键 POST → ~15ms 批量，保证 FIFO 顺序，防请求风暴/乱序）
+  - WS 首次握手失败先重试 WS_FALLBACK_RETRY 次再降级 SSE（避免瞬时抖动导致永久降级）
+  - SSE 连接异常时给出明确提示（原为静默）
+  - 版本号统一为 0.2.4（plugin.py / plugin.json / index.js / README）
 
 v0.2.3 新增（SSE 降级传输）：
   - 部分平台网关反向代理不透传 WebSocket Upgrade 头 → 后端把握手当普通 GET 返回 404，
@@ -53,7 +68,7 @@ from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-PLUGIN_VERSION = "0.2.3"
+PLUGIN_VERSION = "0.2.4"
 
 router = APIRouter()
 
@@ -503,9 +518,31 @@ async def ai_models(request: Request) -> dict:
 
 
 # ============ 交互式 PTY（WebSocket + 会话持久化） ============
+def _notify_sse(entry) -> None:
+    """唤醒所有挂起的 SSE 下行流（有新输出到达）。事件驱动，替代 80ms 轮询。"""
+    for ev in tuple(entry.get("sse_events") or ()):
+        try:
+            ev.set()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _append_buf(entry, data: bytes) -> None:
-    """写入会话历史缓冲（保留尾部 _BUF_MAX 字节，作为全量历史滚动窗口）。"""
-    entry["buf"] = (entry.get("buf", b"") + data)[-_BUF_MAX:]
+    """写入会话历史缓冲（保留尾部 _BUF_MAX 字节，作为全量历史滚动窗口）。
+
+    用 bytearray 原地追加 + 超限时按需裁剪，避免旧实现
+    `(buf + data)[-_BUF_MAX:]` 在缓冲接近上限时每次都整块复制（输出越大越慢，
+    高频输出下 CPU 飙升）。同时唤醒 SSE 下行通道。
+    """
+    buf = entry.get("buf")
+    if not isinstance(buf, bytearray):
+        buf = bytearray(buf or b"")
+        entry["buf"] = buf
+    buf += data
+    over = len(buf) - _BUF_MAX
+    if over > 0:
+        del buf[:over]
+    _notify_sse(entry)
 
 
 def _spawn_pty(session_id: str, cwd: str):
@@ -657,12 +694,33 @@ async def _pty_loop(session_id: str, entry) -> None:
     - 读到 EOF（bash 退出）→ 清理 PTY 记录（会话状态保留，可重新拉起）
     """
     master_fd = entry["master_fd"]
-    while True:
-        try:
-            r, _, _ = select.select([master_fd], [], [], 0.1)
-        except OSError:
-            break
-        if r:
+    loop = asyncio.get_running_loop()
+    readable = asyncio.Event()
+
+    def _on_readable() -> None:
+        readable.set()
+
+    # 事件驱动：fd 可读时由 loop 回调唤醒，避免同步 select.select() 阻塞事件循环。
+    # 旧实现 `select.select(..., 0.1)` 是同步调用，空转时每个会话每轮都会阻塞整个
+    # asyncio 事件循环最多 100ms（实测主服务出现 ~101ms 延迟尖峰）。
+    use_reader = True
+    try:
+        loop.add_reader(master_fd, _on_readable)
+    except (NotImplementedError, OSError, ValueError):
+        use_reader = False  # 极少数环境不支持 add_reader → 回退为非阻塞轮询
+    try:
+        while True:
+            if use_reader:
+                await readable.wait()
+                readable.clear()
+            else:
+                await asyncio.sleep(0.02)
+                try:
+                    r, _, _ = select.select([master_fd], [], [], 0)
+                except OSError:
+                    break
+                if not r:
+                    continue
             try:
                 data = os.read(master_fd, 4096)
             except OSError:
@@ -678,7 +736,12 @@ async def _pty_loop(session_id: str, entry) -> None:
                 except Exception:  # noqa: BLE001
                     # WS 已失效（旧连接关闭竞态）：降级为仅缓冲
                     entry["connected"] = False
-        await asyncio.sleep(0.02)
+    finally:
+        if use_reader:
+            try:
+                loop.remove_reader(master_fd)
+            except Exception:  # noqa: BLE001
+                pass
     # EOF / fd 错误：进程结束，清理记录（不删除会话状态）
     logger.info(
         "[qwenpaw-web-terminal] PTY session %s exited (pid=%s)",
@@ -817,14 +880,16 @@ async def pty_stream(request: Request, session: str = "default"):
     )
 
     async def gen():
+        ev = asyncio.Event()
+        conn_events = entry.setdefault("sse_events", set())
+        conn_events.add(ev)
         try:
             offset = 0
             # 全量回放（前端 onopen 已清屏，语义与 WS attach 一致）
             buf = entry.get("buf") or b""
             if buf:
                 offset = len(buf)
-                yield _sse_frame(buf)
-            idle = 0.0
+                yield _sse_frame(bytes(buf))
             while True:
                 if await request.is_disconnected():
                     break
@@ -834,18 +899,27 @@ async def pty_stream(request: Request, session: str = "default"):
                 if offset > len(buf):  # 缓冲截断（超 _BUF_MAX 丢头部）：回退重发全量
                     offset = 0
                 if len(buf) > offset:
-                    data = buf[offset:]
+                    data = bytes(buf[offset:])
                     offset = len(buf)
-                    idle = 0.0
                     yield _sse_frame(data)
-                else:
-                    idle += _SSE_POLL
-                    if idle >= _SSE_KEEPALIVE:
-                        yield ": ping\n\n"
-                        idle = 0.0
-                await asyncio.sleep(_SSE_POLL)
+                    continue
+                # 无新输出：事件驱动等待（由 _notify_sse 唤醒），超时发 keepalive 注释帧。
+                # 旧实现每 _SSE_POLL(80ms) 轮询一次 buf —— 有延迟且空转耗 CPU。
+                ev.clear()
+                # clear 与检查之间不能有 await，否则可能漏掉刚到达的数据
+                buf = entry.get("buf") or b""
+                if offset > len(buf):
+                    offset = 0
+                if len(buf) > offset:
+                    continue
+                try:
+                    await asyncio.wait_for(ev.wait(), timeout=_SSE_KEEPALIVE)
+                except asyncio.TimeoutError:
+                    yield ": ping\n\n"
         except asyncio.CancelledError:
             pass
+        finally:
+            conn_events.discard(ev)
         # 断开/结束：进程保留后台运行（会话持久化），不清理 entry
 
     return StreamingResponse(
